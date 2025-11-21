@@ -1,4 +1,6 @@
-# QQ聊天机器人长期记忆系统
+# Episodic Memory Chatbot (QQ聊天机器人长期记忆系统)
+
+**English**: Episodic Memory Chatbot | **中文**: QQ聊天机器人长期记忆系统
 
 基于 Qwen3-VL-4B-Thinking 模型的QQ聊天机器人，集成长期记忆存储与检索功能。
 
