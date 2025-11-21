@@ -1,0 +1,102 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 模型文件（通常很大，不纳入版本控制）
+models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.h5
+
+# 训练相关的大文件
+server/models/trained/
+server/models/token_added/
+server/models/memory_db/
+*.pt
+*.pth
+
+# 日志文件
+*.log
+logs/
+server/logs/
+
+# 聊天记录存储（可能包含敏感信息）
+server/chat_history_storage/
+chat_history_storage/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.backup
+*~
+
+# 配置文件中的敏感信息（如果需要）
+# config_qwen3vl.yaml  # 如果包含敏感信息，取消注释
+
+# 测试输出
+test_output/
+*.test
+
+# 数据文件
+*.csv
+*.json
+!**/config*.json  # 保留配置文件
+!**/package.json
+
+# 其他
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# 特殊文件
+=*
+# 看起来像版本号或临时文件的文件
+=0.*
+=*.*
+
+# 如果run.txt包含敏感信息，取消下面的注释
+# run.txt
+
