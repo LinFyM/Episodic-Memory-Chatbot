@@ -924,6 +924,41 @@ class MemoryTrainingService:
     def _standardize_sft_messages(self, sample: Dict[str, Any]) -> List[Dict[str, Any]]:
         return memory_extraction._standardize_sft_messages(self, sample)
     
+    def _is_sft_within_token_limit(
+        self,
+        processor,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+        *,
+        add_generation_prompt: bool = False,
+        desc: str = "SFT"
+    ) -> Tuple[bool, Optional[int]]:
+        """
+        检查SFT样本的token数量是否在限制内
+        """
+        if not max_tokens or not messages:
+            return True, None
+        apply_fn = getattr(processor, "apply_chat_template", None)
+        if not callable(apply_fn):
+            tokenizer = getattr(processor, "tokenizer", None)
+            apply_fn = getattr(tokenizer, "apply_chat_template", None) if tokenizer else None
+        if not callable(apply_fn):
+            _log.warning(f"⚠️ 无法对{desc}样本执行token长度校验（缺少apply_chat_template），默认放行")
+            return True, None
+        try:
+            encoded = apply_fn(
+                messages,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                return_dict=True,
+                return_tensors="pt"
+            )
+            seq_len = encoded["input_ids"].shape[1]
+            return seq_len <= max_tokens, int(seq_len)
+        except Exception as e:
+            _log.warning(f"⚠️ 计算{desc}样本token长度失败，跳过该样本: {e}")
+            return False, None
+    
     def _build_simple_sft_batch(self, processor, messages: List[List[Dict[str, Any]]]):
         """
         简单SFT批处理：将messages转成input_ids并直接用自回归标签（不区分mask）。
@@ -1035,27 +1070,45 @@ class MemoryTrainingService:
             if model is None or tokenizer is None:
                 _log.warning("⚠️ SFT句柄缺失，跳过")
                 return
-            # 加载样本与采样
+            # 加载样本并按长度过滤
             all_samples = self._load_sft_dataset()
             if not all_samples:
                 _log.warning("⚠️ 无SFT数据，跳过")
                 return
+            sft_max_tokens = int(self.training_config.get("sft_max_tokens") or 0)
+            standardized_samples: List[List[Dict[str, Any]]] = []
+            skipped_long = 0
+            for sample in all_samples:
+                m = self._standardize_sft_messages(sample)
+                if not m:
+                    continue
+                if sft_max_tokens:
+                    within_limit, seq_len = self._is_sft_within_token_limit(
+                        tokenizer,
+                        m,
+                        sft_max_tokens,
+                        add_generation_prompt=False,
+                        desc="SFT训练"
+                    )
+                    if not within_limit:
+                        skipped_long += 1
+                        continue
+                standardized_samples.append(m)
+            if skipped_long:
+                _log.info(f"⚠️ SFT长度限制：跳过 {skipped_long} 条超过 {sft_max_tokens} tokens 的样本")
+            if not standardized_samples:
+                _log.warning("⚠️ 无符合长度限制的SFT样本，跳过本次SFT训练")
+                return
             # 使用epoch编号来改变随机种子，确保每个epoch采样不同的样本
             random.seed(self.sft_seed + epoch)
-            # 采样数量与记忆条目数量相同（epoch_sample_n已传入）
-            sample_n = min(epoch_sample_n, len(all_samples)) if epoch_sample_n else len(all_samples)
+            available = len(standardized_samples)
+            sample_n = min(epoch_sample_n, available) if epoch_sample_n else available
             if self.sft_max_per_epoch is not None:
                 sample_n = min(sample_n, int(self.sft_max_per_epoch))
-            picked = random.sample(all_samples, sample_n)
-            std_msgs = []
-            for s in picked:
-                m = self._standardize_sft_messages(s)
-                if m:
-                    std_msgs.append(m)
-            
-            if not std_msgs:
-                _log.warning("⚠️ 本轮SFT无有效样本，跳过")
+            if sample_n <= 0:
+                _log.warning("⚠️ SFT采样数量为0，跳过")
                 return
+            std_msgs = random.sample(standardized_samples, sample_n)
             # 获取SFT训练的batch_size（默认为1，保持向后兼容）
             sft_batch_size = self.training_config.get("sft_batch_size", 1)
             _log.info(f"🧪 本epoch插入SFT: {len(std_msgs)} 条 (batch_size={sft_batch_size})")
@@ -1875,6 +1928,7 @@ class MemoryTrainingService:
             # 加载SFT数据并提取完整内容（截断点将在思考部分内部）
             sft_full_texts = []
             sft_messages_list = []  # 用于混合训练的SFT消息列表
+            sft_max_tokens = int(self.training_config.get("sft_max_tokens") or 0)
             if self.sft_enabled and self.sft_path:
                 try:
                     # 需要processor来将messages转换为文本
@@ -1886,40 +1940,66 @@ class MemoryTrainingService:
                     )
                     
                     sft_samples = self._load_sft_dataset()
+                    skipped_long_sft = 0
+                    total_sft_candidates = 0
                     for sample in sft_samples:
                         messages = self._standardize_sft_messages(sample)
-                        if messages:
-                            # 保存标准化的messages用于混合训练
-                            sft_messages_list.append(messages)
-                            
-                            # 使用processor将messages转换为完整文本（包括所有消息）
-                            try:
-                                # 使用apply_chat_template转换为文本格式
-                                full_text = processor.apply_chat_template(
-                                    messages,
-                                    tokenize=False,
-                                    add_generation_prompt=False
-                                )
-                                
-                                # 检查是否包含思考部分
-                                start_tag = "<think>"
-                                end_tag = "</think>"
-                                start_idx = full_text.find(start_tag)
-                                end_idx = full_text.find(end_tag)
-                                
-                                if start_idx != -1 and end_idx != -1:
-                                    # 找到思考部分，保存完整文本和思考部分的起止位置
-                                    # 注意：这里保存的是完整文本，截断会在训练时进行
-                                    sft_full_texts.append({
-                                        "full_text": full_text,
-                                        "thinking_start": start_idx,
-                                        "thinking_end": end_idx + len(end_tag)
-                                    })
-                            except Exception as e:
-                                _log.debug(f"处理SFT样本失败: {e}")
+                        if not messages:
+                            continue
+                        total_sft_candidates += 1
+                        if sft_max_tokens:
+                            within_limit, seq_len = self._is_sft_within_token_limit(
+                                processor,
+                                messages,
+                                sft_max_tokens,
+                                add_generation_prompt=False,
+                                desc="混合训练SFT"
+                            )
+                            if not within_limit:
+                                skipped_long_sft += 1
                                 continue
+                        # 保存标准化的messages用于混合训练
+                        sft_messages_list.append(messages)
+                        
+                        # 使用processor将messages转换为完整文本（包括所有消息）
+                        try:
+                            # 使用apply_chat_template转换为文本格式
+                            full_text = processor.apply_chat_template(
+                                messages,
+                                tokenize=False,
+                                add_generation_prompt=False
+                            )
+                            
+                            # 检查是否包含思考部分
+                            start_tag = "<think>"
+                            end_tag = "</think>"
+                            start_idx = full_text.find(start_tag)
+                            end_idx = full_text.find(end_tag)
+                            
+                            if start_idx != -1 and end_idx != -1:
+                                # 找到思考部分，保存完整文本和思考部分的起止位置
+                                # 注意：这里保存的是完整文本，截断会在训练时进行
+                                sft_full_texts.append({
+                                    "full_text": full_text,
+                                    "thinking_start": start_idx,
+                                    "thinking_end": end_idx + len(end_tag)
+                                })
+                        except Exception as e:
+                            _log.debug(f"处理SFT样本失败: {e}")
+                            continue
                     
-                    _log.info(f"✅ 从SFT数据中提取了 {len(sft_full_texts)} 条完整文本，{len(sft_messages_list)} 条消息，截断点将控制在思考部分内部")
+                    if skipped_long_sft:
+                        _log.info(
+                            f"⚠️ SFT样本长度限制：跳过 {skipped_long_sft}/{total_sft_candidates} 条超过 {sft_max_tokens} tokens 的样本"
+                        )
+                    
+                    if sft_messages_list:
+                        _log.info(
+                            f"✅ 从SFT数据中提取了 {len(sft_full_texts)} 条完整文本，"
+                            f"{len(sft_messages_list)} 条消息，截断点将控制在思考部分内部"
+                        )
+                    else:
+                        _log.warning("⚠️ 所有SFT样本因长度限制或解析失败被跳过，将无法插入SFT数据")
                 except Exception as e:
                     _log.warning(f"⚠️ 加载SFT数据失败，将使用记忆条目作为上下文: {e}")
 
