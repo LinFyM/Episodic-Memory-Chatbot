@@ -22,25 +22,6 @@
 
 默认会监听 `configs/config_qwen3vl.yaml` 中的 `server.host`/`server.port`（初始值 `0.0.0.0:9999`）。
 
-## QQ 客户端运行
-
-服务器只负责推理/训练，要让 QQ 账号真正上线，还需要在本地运行 Napcat + `client/qqbot_client_full.py`：
-
-1. 安装并登录 Napcat（或其他支持 OneBot v11 的 QQ 协议端）
-2. 在本地机器上安装依赖
-   ```bash
-   pip install -r client/requirements.txt
-   ```
-3. 编辑 `client/qqbot_client_full.py`
-   - `SERVER_URL` 改成你的服务器地址，例如 `http://your-server-ip:9999`
-   - `config.set_bot_uin` / `config.set_ws_uri` / `config.set_token` 按 Napcat 的配置填写
-4. 运行客户端
-   ```bash
-   python client/qqbot_client_full.py
-   ```
-
-客户端会把 QQ 消息转发到服务器的 `/api/chat/*` 接口，并负责执行服务器返回的动作指令（如表情、戳一戳等）。更详细的参数和故障排查可以参考 `client/README.md`。
-
 ## 项目结构
 
 ```
@@ -91,6 +72,38 @@ memory:
 - `memory_vectorization`：批量向量提取时的文本压缩提示
 
 如果需要调整提示词，直接编辑该文件后重启/重新加载配置即可。
+
+## 客户端部署
+
+本项目采用**客户端-服务器分离架构**：
+
+- **服务器端**：运行在GPU服务器上，负责LLM推理、记忆管理、训练等
+- **客户端**：运行在个人电脑上，负责连接QQ并转发消息到服务器
+
+### 客户端安装与配置
+
+1. **安装依赖**（在个人电脑上）：
+   ```bash
+   pip install ncatbot requests flask-cors
+   ```
+
+2. **配置客户端**：
+   编辑 `client/qqbot_client_full.py`，修改以下配置：
+   ```python
+   SERVER_URL = "http://your-server-ip:9999"  # 替换为实际服务器IP
+   config.set_bot_uin("你的QQ号")
+   config.set_ws_uri("ws://localhost:3001")  # napcat的WebSocket地址
+   config.set_token("你的token")
+   ```
+
+3. **启动napcat**（QQ协议实现，需要在本地运行）
+
+4. **启动客户端**：
+   ```bash
+   python client/qqbot_client_full.py
+   ```
+
+详细说明请参考 [`client/README.md`](client/README.md)。
 
 ## API端点
 
