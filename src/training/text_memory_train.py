@@ -550,6 +550,8 @@ class MixedMemorySFTDataset(Dataset):
         )
         
         # 初始化混合数据索引
+        self.last_sft_only_indices = []
+        self.last_sft_full_indices = []
         self.refresh_epoch_data()
         
         if self.is_main_process():
@@ -579,6 +581,8 @@ class MixedMemorySFTDataset(Dataset):
         sft_count = len(self.sft_messages_list)
         
         self.mixed_indices = []
+        self.last_sft_only_indices = []
+        self.last_sft_full_indices = []
         if memory_count > 0:
             memory_indices = list(range(memory_count))
             random.shuffle(memory_indices)
@@ -594,9 +598,11 @@ class MixedMemorySFTDataset(Dataset):
                 sft_full_indices = self._sample_indices(len(self.memory_dataset.sft_full_texts), memory_full_count)
                 for mem_idx, sft_idx in zip(memory_indices[memory_front_count:], sft_full_indices):
                     self.mixed_indices.append(('memory_full', mem_idx, sft_idx))
+                self.last_sft_full_indices = sft_full_indices[:]
             else:
                 for idx in memory_indices[memory_front_count:]:
                     self.mixed_indices.append(('memory_front', idx, None))
+                self.last_sft_full_indices = []
             
             # 纯SFT样本（数量为记忆条目的一半，向下取整，至少为1）
             sft_only_target = memory_count // 2
@@ -606,12 +612,16 @@ class MixedMemorySFTDataset(Dataset):
                 sft_only_indices = self._sample_indices(sft_count, sft_only_target)
                 for sft_idx in sft_only_indices:
                     self.mixed_indices.append(('sft', sft_idx, None))
+                self.last_sft_only_indices = sft_only_indices[:]
+            else:
+                self.last_sft_only_indices = []
         else:
             # 没有记忆条目，只能返回SFT样本
             sample_sft = min(32, sft_count)
             sft_only_indices = self._sample_indices(sft_count, sample_sft)
             for sft_idx in sft_only_indices:
                 self.mixed_indices.append(('sft', sft_idx, None))
+            self.last_sft_only_indices = sft_only_indices[:]
         
         random.shuffle(self.mixed_indices)
         self.total_samples = len(self.mixed_indices)
@@ -624,10 +634,18 @@ class MixedMemorySFTDataset(Dataset):
             type_b = sum(1 for item in self.mixed_indices if item[0] == 'memory_full')
             type_c = sum(1 for item in self.mixed_indices if item[0] == 'sft')
             print(f"✅ 混合数据刷新完成: {self.total_samples} 个样本 (记忆-前置: {type_a}, 记忆-前后拼接: {type_b}, 纯SFT: {type_c})")
-            if type_c > 0 and sft_count > 0:
-                preview = min(5, sft_count)
-                display_indices = sorted(self._sample_indices(sft_count, preview))
-                print(f"   📋 示例SFT数据索引: {display_indices}")
+            if self.last_sft_only_indices:
+                preview = min(5, len(self.last_sft_only_indices))
+                preview_indices = sorted(self.last_sft_only_indices[:preview])
+                print(f"   📋 纯SFT样本原始索引(前{preview}条): {preview_indices}")
+                if len(self.last_sft_only_indices) > preview:
+                    print(f"   ... 共 {len(self.last_sft_only_indices)} 条纯SFT样本")
+            if self.last_sft_full_indices:
+                preview = min(5, len(self.last_sft_full_indices))
+                preview_indices = sorted(self.last_sft_full_indices[:preview])
+                print(f"   📋 夹心SFT样本原始索引(前{preview}条): {preview_indices}")
+                if len(self.last_sft_full_indices) > preview:
+                    print(f"   ... 共 {len(self.last_sft_full_indices)} 条夹心SFT样本")
     
     def __len__(self):
         return self.total_samples
