@@ -519,33 +519,27 @@ class MixedMemorySFTDataset(Dataset):
         end_prompts=None,
         memory_ratio=0.5,  # 记忆条目在混合数据中的比例
         guide_text=None,
-        sft_message_source_indices=None,
-        sft_full_source_indices=None,
+        sft_epoch_sampler=None,
+        sft_epoch_sampler_total: Optional[int] = None,
     ):
         self.memory_texts = memory_texts
         self.memory_embeddings = memory_embeddings
-        self.full_sft_messages_list = sft_messages_list if sft_messages_list is not None else []
-        self.sft_message_source_indices = (
-            sft_message_source_indices
-            if sft_message_source_indices is not None
-            else list(range(len(self.full_sft_messages_list)))
-        )
-        self.sft_messages_list = self.full_sft_messages_list
+        self.sft_messages_list = sft_messages_list if sft_messages_list is not None else []
         self.tokenizer = tokenizer
         self.base_model = base_model
         self.max_length = max_length
         self.noise_std = noise_std
         self._is_main_process_fn = is_main_process_fn
         self.sft_full_texts = sft_full_texts if sft_full_texts is not None else []
-        self.sft_full_source_indices = (
-            sft_full_source_indices
-            if sft_full_source_indices is not None
-            else list(range(len(self.sft_full_texts)))
-        )
         self.activation_prompts = _ensure_prompt_list(activation_prompts, "activation_prompts")
         self.end_prompts = _ensure_prompt_list(end_prompts, "end_prompts")
         self.memory_ratio = memory_ratio
         self.guide_text = guide_text or ""
+        self.sft_epoch_sampler = sft_epoch_sampler
+        self.sft_epoch_sampler_total = sft_epoch_sampler_total or 0
+        self.default_sft_only_target = 32
+        self.current_sft_msg_source_indices: List[int] = []
+        self.current_sft_full_source_indices: List[int] = []
         
         # 创建记忆条目数据集（用于生成记忆训练样本）
         self.memory_dataset = EnhancedTextMemoryDataset(
@@ -591,6 +585,30 @@ class MixedMemorySFTDataset(Dataset):
     def refresh_epoch_data(self):
         """每个epoch开始时重新抽取数据"""
         memory_count = len(self.memory_texts)
+
+        if self.sft_epoch_sampler is not None:
+            pure_target = memory_count // 2
+            if memory_count == 1:
+                pure_target = 1
+            if pure_target <= 0:
+                pure_target = min(self.default_sft_only_target, self.sft_epoch_sampler_total or self.default_sft_only_target)
+            full_target = memory_count // 2
+            try:
+                sampled_full_texts, sampled_messages, msg_sources, full_sources = self.sft_epoch_sampler(
+                    pure_target,
+                    full_target
+                )
+            except Exception as sampler_error:
+                raise RuntimeError(f"SFT抽样失败: {sampler_error}")
+            self.sft_messages_list = sampled_messages
+            if sampled_full_texts:
+                self.memory_dataset.sft_full_texts = sampled_full_texts
+            self.current_sft_msg_source_indices = msg_sources
+            self.current_sft_full_source_indices = full_sources
+        else:
+            self.current_sft_msg_source_indices = []
+            self.current_sft_full_source_indices = []
+
         sft_count = len(self.sft_messages_list)
         
         self.mixed_indices = []
@@ -650,24 +668,30 @@ class MixedMemorySFTDataset(Dataset):
             if self.last_sft_only_indices:
                 preview = min(5, len(self.last_sft_only_indices))
                 preview_indices = sorted(self.last_sft_only_indices[:preview])
-                mapped = sorted(
-                    self.sft_message_source_indices[idx]
-                    if idx < len(self.sft_message_source_indices)
-                    else idx
-                    for idx in preview_indices
-                )
+                if self.current_sft_msg_source_indices:
+                    mapped = [
+                        self.current_sft_msg_source_indices[idx]
+                        if idx < len(self.current_sft_msg_source_indices)
+                        else idx
+                        for idx in preview_indices
+                    ]
+                else:
+                    mapped = preview_indices
                 print(f"   📋 纯SFT样本原始索引(前{preview}条): {mapped}")
                 if len(self.last_sft_only_indices) > preview:
                     print(f"   ... 共 {len(self.last_sft_only_indices)} 条纯SFT样本")
             if self.last_sft_full_indices:
                 preview = min(5, len(self.last_sft_full_indices))
                 preview_indices = sorted(self.last_sft_full_indices[:preview])
-                mapped = sorted(
-                    self.sft_full_source_indices[idx]
-                    if idx < len(self.sft_full_source_indices)
-                    else idx
-                    for idx in preview_indices
-                )
+                if self.current_sft_full_source_indices:
+                    mapped = [
+                        self.current_sft_full_source_indices[idx]
+                        if idx < len(self.current_sft_full_source_indices)
+                        else idx
+                        for idx in preview_indices
+                    ]
+                else:
+                    mapped = preview_indices
                 print(f"   📋 夹心SFT样本原始索引(前{preview}条): {mapped}")
                 if len(self.last_sft_full_indices) > preview:
                     print(f"   ... 共 {len(self.last_sft_full_indices)} 条夹心SFT样本")
@@ -1633,8 +1657,8 @@ class EnhancedTextMemoryTrainer:
         shuffle=True,
         noise_std=0.01,
         sft_full_texts=None,
-        sft_message_source_indices=None,
-        sft_full_source_indices=None
+        sft_epoch_sampler=None,
+        sft_epoch_sampler_total: Optional[int] = None,
     ):
         """创建混合数据加载器（记忆条目+SFT数据）"""
         dataset = MixedMemorySFTDataset(
@@ -1651,8 +1675,8 @@ class EnhancedTextMemoryTrainer:
             end_prompts=self.end_prompts,
             memory_ratio=0.5,  # 记忆条目占50%
             guide_text=self.guide_text,
-            sft_message_source_indices=sft_message_source_indices,
-            sft_full_source_indices=sft_full_source_indices
+            sft_epoch_sampler=sft_epoch_sampler,
+            sft_epoch_sampler_total=sft_epoch_sampler_total,
         )
         # 让 Accelerator 接管 sampler/loader
         loader = DataLoader(
@@ -2236,8 +2260,8 @@ class EnhancedTextMemoryTrainer:
         save_path="enhanced_memory_model",
         sft_full_texts=None,
         sft_messages_list=None,
-        sft_full_source_indices=None,
-        sft_message_source_indices=None
+        sft_epoch_sampler=None,
+        sft_epoch_sampler_total: Optional[int] = None,
     ):
         """增强的训练流程 - 支持混合训练（记忆条目+SFT数据）"""
         
@@ -2262,17 +2286,18 @@ class EnhancedTextMemoryTrainer:
             print(f"   记忆条目数量: {len(texts)}")
         
         # 创建混合数据加载器（如果提供了SFT数据）
-        if sft_messages_list and len(sft_messages_list) > 0:
+        if sft_messages_list is not None or sft_epoch_sampler is not None:
+            base_sft_messages = sft_messages_list if sft_messages_list is not None else []
             train_loader, dataset = self.create_mixed_dataloader(
                 texts,
                 embeddings,
-                sft_messages_list,
+                base_sft_messages,
                 batch_size,
                 True,
                 noise_std,
                 sft_full_texts=sft_full_texts,
-                sft_message_source_indices=sft_message_source_indices,
-                sft_full_source_indices=sft_full_source_indices
+                sft_epoch_sampler=sft_epoch_sampler,
+                sft_epoch_sampler_total=sft_epoch_sampler_total,
             )
         else:
             # 回退到原有的数据加载器

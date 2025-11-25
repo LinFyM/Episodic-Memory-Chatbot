@@ -1002,82 +1002,71 @@ class MemoryTrainingService:
             _log.info(f"⚠️ {desc}长度限制：跳过 {skipped}/{len(texts)} 条超过 {max_tokens} tokens 的样本")
         return eligible
 
-    def _load_sft_messages_with_target(
+    def _sample_sft_for_epoch(
         self,
-        model_path: str,
+        sample_records: List[Dict[str, Any]],
+        processor,
+        max_tokens: int,
         pure_target: int,
         full_target: int
     ) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]], List[int], List[int]]:
-        if not self.sft_enabled or not self.sft_path or (pure_target <= 0 and full_target <= 0):
+        if not sample_records or (pure_target <= 0 and full_target <= 0):
             return [], [], [], []
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            local_files_only=True
-        )
-        sft_samples = self._load_sft_dataset()
-        if not sft_samples:
-            raise ValueError("未找到可用的SFT数据集，请确认路径配置。")
-        sft_max_tokens = int(self.training_config.get("sft_max_tokens") or 0)
-        valid_sft_messages: List[List[Dict[str, Any]]] = []
-        valid_sft_full_texts: List[Dict[str, Any]] = []
-        sft_message_source_indices: List[int] = []
-        sft_full_source_indices: List[int] = []
-        skipped_long = 0
-        processed = 0
-        for sample_idx, sample in enumerate(sft_samples):
-            messages = self._standardize_sft_messages(sample)
-            if not messages:
-                continue
-            processed += 1
-            if sft_max_tokens:
-                within_limit, seq_len = self._is_sft_within_token_limit(
+        candidate_indices = list(range(len(sample_records)))
+        random.shuffle(candidate_indices)
+        selected_messages: List[List[Dict[str, Any]]] = []
+        selected_message_sources: List[int] = []
+        selected_full_texts: List[Dict[str, Any]] = []
+        selected_full_sources: List[int] = []
+        for idx in candidate_indices:
+            record = sample_records[idx]
+            messages = record["messages"]
+            origin_index = record["index"]
+            if max_tokens:
+                within_limit, _ = self._is_sft_within_token_limit(
                     processor,
                     messages,
-                    sft_max_tokens,
+                    max_tokens,
                     add_generation_prompt=False,
-                    desc="混合训练SFT"
+                    desc="SFT epoch sampler"
                 )
                 if not within_limit:
-                    skipped_long += 1
                     continue
-            valid_sft_messages.append(messages)
-            sft_message_source_indices.append(sample_idx)
-            try:
-                full_text = processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False
-                )
-                start_tag = "<think>"
-                end_tag = "</think>"
-                start_idx = full_text.find(start_tag)
-                end_idx = full_text.find(end_tag)
-                if start_idx != -1 and end_idx != -1:
-                    valid_sft_full_texts.append({
-                        "full_text": full_text,
-                        "thinking_start": start_idx,
-                        "thinking_end": end_idx + len(end_tag)
-                    })
-                    sft_full_source_indices.append(sample_idx)
-            except Exception as e:
-                _log.debug(f"处理SFT样本失败: {e}")
-                pass
-        if skipped_long:
-            _log.info(
-                f"⚠️ SFT样本长度限制：跳过 {skipped_long} 条超过 {sft_max_tokens} tokens 的样本"
-            )
-        if len(valid_sft_messages) < pure_target or len(valid_sft_full_texts) < full_target:
+            if pure_target > 0 and len(selected_messages) < pure_target:
+                selected_messages.append(messages)
+                selected_message_sources.append(origin_index)
+            if full_target > 0 and len(selected_full_texts) < full_target:
+                try:
+                    full_text = processor.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=False
+                    )
+                    start_tag = "<think>"
+                    end_tag = "</think>"
+                    start_idx = full_text.find(start_tag)
+                    end_idx = full_text.find(end_tag)
+                    if start_idx != -1 and end_idx != -1:
+                        selected_full_texts.append({
+                            "full_text": full_text,
+                            "thinking_start": start_idx,
+                            "thinking_end": end_idx + len(end_tag)
+                        })
+                        selected_full_sources.append(origin_index)
+                except Exception as e:
+                    _log.debug(f"处理SFT样本失败: {e}")
+            if (pure_target <= 0 or len(selected_messages) >= pure_target) and (
+                full_target <= 0 or len(selected_full_texts) >= full_target
+            ):
+                break
+        need_pure = pure_target > 0 and len(selected_messages) < pure_target
+        need_full = full_target > 0 and len(selected_full_texts) < full_target
+        if need_pure or need_full:
             raise ValueError(
-                f"SFT长度过滤后数量不足：纯SFT需要 {pure_target} 条（当前 {len(valid_sft_messages)} 条），"
-                f"夹心需要 {full_target} 条（当前 {len(valid_sft_full_texts)} 条）。"
+                f"SFT抽样不足：纯SFT目标 {pure_target} / 实际 {len(selected_messages)}，"
+                f"夹心目标 {full_target} / 实际 {len(selected_full_texts)}。"
             )
-        _log.info(
-            f"✅ SFT筛选完成：纯SFT候选 {len(valid_sft_messages)} 条，夹心候选 {len(valid_sft_full_texts)} 条，"
-            f"共处理 {processed} 条原始样本。"
-        )
-        return valid_sft_full_texts, valid_sft_messages, sft_full_source_indices, sft_message_source_indices
+        return selected_full_texts, selected_messages, selected_message_sources, selected_full_sources
     
     def _build_simple_sft_batch(self, processor, messages: List[List[Dict[str, Any]]]):
         """
@@ -2068,23 +2057,35 @@ class MemoryTrainingService:
             training_data = torch.load(temp_data_path, map_location='cpu')
             memory_texts = training_data.get('texts', [])
             self._current_epoch_sample_n = len(memory_texts)
-            sft_full_texts = []
-            sft_messages_list = []
-            sft_full_source_indices = []
-            sft_message_source_indices = []
-            if memory_texts:
-                pure_target = max(1, len(memory_texts) // 2)
-                full_target = len(memory_texts) // 2
-                (
-                    sft_full_texts,
-                    sft_messages_list,
-                    sft_full_source_indices,
-                    sft_message_source_indices
-                ) = self._load_sft_messages_with_target(
-                    model_path,
-                    pure_target,
-                    full_target
-                )
+            sft_full_texts: List[Dict[str, Any]] = []
+            sft_messages_list: List[List[Dict[str, Any]]] = []
+            sft_epoch_sampler = None
+            sft_epoch_sampler_total = 0
+            sft_max_tokens = int(self.training_config.get("sft_max_tokens") or 0)
+            if self.sft_enabled and self.sft_path:
+                try:
+                    raw_sft_samples = self._load_sft_dataset()
+                    standardized_sft_samples = []
+                    for idx, sample in enumerate(raw_sft_samples):
+                        messages = self._standardize_sft_messages(sample)
+                        if messages:
+                            standardized_sft_samples.append({
+                                "messages": messages,
+                                "index": idx
+                            })
+                    sft_epoch_sampler_total = len(standardized_sft_samples)
+                    if standardized_sft_samples:
+                        def _epoch_sampler(pure_target: int, full_target: int):
+                            return self._sample_sft_for_epoch(
+                                standardized_sft_samples,
+                                preloaded_processor,
+                                sft_max_tokens,
+                                pure_target,
+                                full_target
+                            )
+                        sft_epoch_sampler = _epoch_sampler
+                except Exception as sampler_error:
+                    _log.warning(f"⚠️ 初始化SFT采样器失败: {sampler_error}")
             if self.sft_enabled and self.sft_path and memory_texts:
                 memory_count = len(memory_texts)
                 memory_full_count = memory_count // 2
@@ -2110,8 +2111,8 @@ class MemoryTrainingService:
                 save_path=step2_save_path,
                 sft_full_texts=sft_full_texts if sft_full_texts else None,
                 sft_messages_list=sft_messages_list if sft_messages_list else None,
-                sft_full_source_indices=sft_full_source_indices if sft_full_source_indices else None,
-                sft_message_source_indices=sft_message_source_indices if sft_message_source_indices else None
+                sft_epoch_sampler=sft_epoch_sampler,
+                sft_epoch_sampler_total=sft_epoch_sampler_total,
             )
             _ = res2
 
