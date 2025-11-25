@@ -959,6 +959,44 @@ class MemoryTrainingService:
             _log.warning(f"⚠️ 计算{desc}样本token长度失败，跳过该样本: {e}")
             return False, None
     
+    @staticmethod
+    def _get_base_tokenizer(processor):
+        if hasattr(processor, "tokenizer"):
+            return processor.tokenizer
+        return processor
+
+    def _filter_plain_texts_by_token_limit(
+        self,
+        tokenizer,
+        texts: List[str],
+        max_tokens: int,
+        desc: str
+    ) -> List[int]:
+        if not max_tokens or not texts:
+            return list(range(len(texts)))
+        eligible = []
+        skipped = 0
+        for idx, text in enumerate(texts):
+            try:
+                encoded = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    add_special_tokens=True,
+                    padding=False,
+                    truncation=False
+                )
+                seq_len = encoded["input_ids"].shape[1]
+                if seq_len <= max_tokens:
+                    eligible.append(idx)
+                else:
+                    skipped += 1
+            except Exception as e:
+                _log.warning(f"⚠️ 计算{desc}样本token长度失败，跳过该样本: {e}")
+                skipped += 1
+        if skipped:
+            _log.info(f"⚠️ {desc}长度限制：跳过 {skipped}/{len(texts)} 条超过 {max_tokens} tokens 的样本")
+        return eligible
+    
     def _build_simple_sft_batch(self, processor, messages: List[List[Dict[str, Any]]]):
         """
         简单SFT批处理：将messages转成input_ids并直接用自回归标签（不区分mask）。
@@ -1101,14 +1139,18 @@ class MemoryTrainingService:
                 return
             # 使用epoch编号来改变随机种子，确保每个epoch采样不同的样本
             random.seed(self.sft_seed + epoch)
-            available = len(standardized_samples)
-            sample_n = min(epoch_sample_n, available) if epoch_sample_n else available
+            target_n = epoch_sample_n if epoch_sample_n else len(standardized_samples)
             if self.sft_max_per_epoch is not None:
-                sample_n = min(sample_n, int(self.sft_max_per_epoch))
-            if sample_n <= 0:
+                target_n = min(target_n, int(self.sft_max_per_epoch))
+            if target_n <= 0:
                 _log.warning("⚠️ SFT采样数量为0，跳过")
                 return
-            std_msgs = random.sample(standardized_samples, sample_n)
+            if len(standardized_samples) < target_n:
+                raise ValueError(
+                    f"SFT样本不足：需要 {target_n} 条满足长度限制的样本，"
+                    f"但仅有 {len(standardized_samples)} 条可用。"
+                )
+            std_msgs = random.sample(standardized_samples, target_n)
             # 获取SFT训练的batch_size（默认为1，保持向后兼容）
             sft_batch_size = self.training_config.get("sft_batch_size", 1)
             _log.info(f"🧪 本epoch插入SFT: {len(std_msgs)} 条 (batch_size={sft_batch_size})")
@@ -1742,18 +1784,24 @@ class MemoryTrainingService:
 
                 # 计算需要的SFT向量数量：1.5倍于记忆条目数量
                 required_sft_count = int(memory_count * 1.5)
-                actual_sft_count = min(required_sft_count, sft_total_count)
-
-                # 随机抽取SFT向量
-                if actual_sft_count < sft_total_count:
-                    import random
-                    random.seed(42)  # 确保可重现
-                    selected_indices = random.sample(range(sft_total_count), actual_sft_count)
-                    selected_sft_texts = [sft_texts[i] for i in selected_indices]
-                    selected_sft_embeddings = sft_embeddings[selected_indices]
-                else:
-                    selected_sft_texts = sft_texts
-                    selected_sft_embeddings = sft_embeddings
+                sft_max_tokens = int(self.training_config.get("sft_max_tokens") or 0)
+                tokenizer_for_sft = self._get_base_tokenizer(processor)
+                eligible_indices = self._filter_plain_texts_by_token_limit(
+                    tokenizer_for_sft,
+                    sft_texts,
+                    sft_max_tokens,
+                    desc="Recall阶段SFT向量"
+                )
+                if len(eligible_indices) < required_sft_count:
+                    raise ValueError(
+                        f"有效的SFT向量不足：需要 {required_sft_count} 条，"
+                        f"但仅有 {len(eligible_indices)} 条满足 <= {sft_max_tokens} tokens 的限制。"
+                    )
+                import random
+                random.seed(42)
+                selected_indices = random.sample(eligible_indices, required_sft_count)
+                selected_sft_texts = [sft_texts[i] for i in selected_indices]
+                selected_sft_embeddings = sft_embeddings[selected_indices]
 
                 # 合并数据
                 combined_texts = memory_texts + selected_sft_texts
@@ -1999,7 +2047,9 @@ class MemoryTrainingService:
                             f"{len(sft_messages_list)} 条消息，截断点将控制在思考部分内部"
                         )
                     else:
-                        _log.warning("⚠️ 所有SFT样本因长度限制或解析失败被跳过，将无法插入SFT数据")
+                        raise ValueError(
+                            "所有SFT样本因长度限制或解析失败被跳过，无法满足训练所需的SFT数量。"
+                        )
                 except Exception as e:
                     _log.warning(f"⚠️ 加载SFT数据失败，将使用记忆条目作为上下文: {e}")
 
@@ -2015,6 +2065,22 @@ class MemoryTrainingService:
             training_data = torch.load(temp_data_path, map_location='cpu')
             memory_texts = training_data.get('texts', [])
             self._current_epoch_sample_n = len(memory_texts)
+            if self.sft_enabled and self.sft_path and memory_texts:
+                memory_count = len(memory_texts)
+                memory_full_count = memory_count // 2
+                sft_only_target = memory_count // 2
+                if memory_count == 1:
+                    sft_only_target = 1
+                if sft_only_target and len(sft_messages_list) < sft_only_target:
+                    raise ValueError(
+                        f"SFT样本不足：需要至少 {sft_only_target} 条用于纯SFT训练，"
+                        f"但仅有 {len(sft_messages_list)} 条符合长度限制。"
+                    )
+                if memory_full_count > 0 and len(sft_full_texts) < memory_full_count:
+                    raise ValueError(
+                        f"SFT完整文本不足：需要至少 {memory_full_count} 条包含<think>的SFT样本，"
+                        f"但仅有 {len(sft_full_texts)} 条满足条件。"
+                    )
             res2 = trainer.train(
                 pt_file_path=temp_data_path,
                 num_epochs=memory_epochs,
