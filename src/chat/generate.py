@@ -62,9 +62,12 @@ def memory_head(query_vector, memory_db, debug=False):
         return None, None
 
     _log.info(f"🔍 [Memory Head] 找到 {len(search_results)} 个候选记忆向量")
-    for i, result in enumerate(search_results):
+    # 只打印前5个候选的相似度
+    for i, result in enumerate(search_results[:5]):
         score = result.get('score', 0.0)
         _log.info(f"  [{i+1}] 相似度={score:.4f}")
+    if len(search_results) > 5:
+        _log.info(f"  ... 还有 {len(search_results) - 5} 个候选未显示")
 
     # 提取logits（相似度分数），与lm_head输出logits完全一致
     memory_logits = torch.tensor(
