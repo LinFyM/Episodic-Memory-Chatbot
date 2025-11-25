@@ -1856,44 +1856,18 @@ class EnhancedTextMemoryTrainer:
         recall_token_count = len(recall_tokens)
         
         # 为了测试模型在真实场景下的表现，测试时也应该有上下文
-        # 使用和训练时一样的上下文处理方式：必须从SFT数据中随机选择并截断
+        # 直接复用训练时的上下文处理逻辑
+        import random
         test_context_text = ""
         
-        # 必须提供SFT数据，测试时应该和训练时使用相同的上下文来源
-        if not sft_full_texts or len(sft_full_texts) == 0:
-            print("⚠️ 警告: 测试时未提供SFT数据，无法使用SFT截断文本作为上下文")
-            print("   测试将使用空上下文，这可能影响测试结果的准确性")
-        else:
-            import random
-            # 取一个安全的embedding样本（tensor/list都可）
-            def _pick_one_embedding(embs):
-                try:
-                    hidden_size = getattr(self.merged_model.config, "hidden_size", 4096)
-                except Exception:
-                    hidden_size = 4096
-                if isinstance(embs, torch.Tensor):
-                    if embs.numel() == 0:
-                        return torch.zeros((1, hidden_size), device=embs.device)
-                    return embs[:1]
-                if isinstance(embs, (list, tuple)) and len(embs) > 0:
-                    first = embs[0]
-                    if isinstance(first, torch.Tensor):
-                        if first.dim() == 1:
-                            first = first.unsqueeze(0)
-                        return first[:1]
-                    try:
-                        return torch.tensor(first, dtype=torch.float32).unsqueeze(0)
-                    except Exception:
-                        return torch.zeros((1, hidden_size))
-                return torch.zeros((1, hidden_size))
-
-            # 随机选择一个SFT数据
+        # 和训练时完全一样的逻辑：优先从SFT数据中随机选择并截断
+        if sft_full_texts and len(sft_full_texts) > 0:
             sft_data = random.choice(sft_full_texts)
-            # 使用和训练时一样的截断方法：_split_sft_at_thinking
-            # 创建一个临时的dataset对象来使用这个方法
-            temp_dataset_for_context = EnhancedTextMemoryDataset(
-                texts[:1] if texts else ["dummy"],  # 只需要一个dummy text
-                _pick_one_embedding(embeddings),  # 只需要一个dummy embedding
+            # 创建一个临时的dataset对象来使用_split_sft_at_thinking方法
+            # 只需要dummy数据即可，因为我们只需要调用_split_sft_at_thinking
+            temp_dataset = EnhancedTextMemoryDataset(
+                ["dummy"],  # dummy text
+                torch.zeros(1, 2560),  # dummy embedding
                 self.tokenizer,
                 self.merged_model,
                 max_length=self.dataset_max_length,
@@ -1904,18 +1878,8 @@ class EnhancedTextMemoryTrainer:
                 end_prompts=self.end_prompts,
                 guide_text=self.guide_text,
             )
-            # 使用和训练时一样的截断方法
-            test_context_text, _ = temp_dataset_for_context._split_sft_at_thinking(sft_data)
-            
-            # 如果截断后为空，尝试使用完整的SFT文本（去掉thinking部分）
-            if not test_context_text or not test_context_text.strip():
-                full_text = sft_data.get("full_text", "")
-                thinking_start = sft_data.get("thinking_start", 0)
-                if thinking_start > 0:
-                    test_context_text = full_text[:thinking_start].strip()
-                else:
-                    # 如果找不到thinking部分，使用前一半文本作为上下文
-                    test_context_text = full_text[:len(full_text)//2].strip()
+            # 使用和训练时完全一样的截断方法
+            test_context_text, _ = temp_dataset._split_sft_at_thinking(sft_data)
         
         # 测试时使用固定的激活提示语（使用第一个，确保测试一致性）
         test_activation_prompt = self.activation_prompts[0].strip() if self.activation_prompts else ""
@@ -1930,7 +1894,8 @@ class EnhancedTextMemoryTrainer:
         # 构造完整输入序列
         full_input_tokens = context_tokens + activation_tokens + core_input_tokens
         # embedding插入位置：必须是<|memory_pad|>的位置，也就是序列的最后一个位置
-        # 直接使用最后一个位置，确保正确
+        # 注意：Python列表索引从0开始，如果序列长度是N，那么最后一个位置的索引是N-1
+        # 例如：序列长度38，索引范围是0-37，最后一个位置是37（即38-1）
         embedding_position = len(full_input_tokens) - 1
         
         # 验证：<|memory_pad|>应该在最后一个位置
@@ -1938,6 +1903,7 @@ class EnhancedTextMemoryTrainer:
             print(f"⚠️ 警告: <|memory_pad|>不在最后一个位置")
             print(f"   最后一个token ID: {full_input_tokens[-1]}, 期望: {memory_pad_id}")
             print(f"   输入序列长度: {len(full_input_tokens)}")
+            print(f"   embedding位置: {embedding_position} (应该是最后一个位置的索引)")
         
         print(f"📋 测试配置:")
         print(f"   上下文: {'有 (' + str(len(context_tokens)) + ' tokens)' if test_context_text else '无'}")
