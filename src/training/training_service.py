@@ -973,10 +973,15 @@ class MemoryTrainingService:
         desc: str
     ) -> List[int]:
         if not max_tokens or not texts:
-            return list(range(len(texts)))
+            indices = list(range(len(texts)))
+            random.shuffle(indices)
+            return indices
         eligible = []
         skipped = 0
-        for idx, text in enumerate(texts):
+        indices = list(range(len(texts)))
+        random.shuffle(indices)
+        for idx in indices:
+            text = texts[idx]
             try:
                 encoded = tokenizer(
                     text,
@@ -996,6 +1001,82 @@ class MemoryTrainingService:
         if skipped:
             _log.info(f"⚠️ {desc}长度限制：跳过 {skipped}/{len(texts)} 条超过 {max_tokens} tokens 的样本")
         return eligible
+
+    def _load_sft_messages_with_target(
+        self,
+        model_path: str,
+        pure_target: int,
+        full_target: int
+    ) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
+        if not self.sft_enabled or not self.sft_path or (pure_target <= 0 and full_target <= 0):
+            return [], []
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            local_files_only=True
+        )
+        sft_samples = self._load_sft_dataset()
+        if not sft_samples:
+            raise ValueError("未找到可用的SFT数据集，请确认路径配置。")
+        sft_max_tokens = int(self.training_config.get("sft_max_tokens") or 0)
+        random.shuffle(sft_samples)
+        sft_messages_list: List[List[Dict[str, Any]]] = []
+        sft_full_texts: List[Dict[str, Any]] = []
+        skipped_long = 0
+        processed = 0
+        for sample in sft_samples:
+            messages = self._standardize_sft_messages(sample)
+            if not messages:
+                continue
+            processed += 1
+            if sft_max_tokens:
+                within_limit, seq_len = self._is_sft_within_token_limit(
+                    processor,
+                    messages,
+                    sft_max_tokens,
+                    add_generation_prompt=False,
+                    desc="混合训练SFT"
+                )
+                if not within_limit:
+                    skipped_long += 1
+                    continue
+            sft_messages_list.append(messages)
+            try:
+                full_text = processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                start_tag = "<think>"
+                end_tag = "</think>"
+                start_idx = full_text.find(start_tag)
+                end_idx = full_text.find(end_tag)
+                if start_idx != -1 and end_idx != -1:
+                    sft_full_texts.append({
+                        "full_text": full_text,
+                        "thinking_start": start_idx,
+                        "thinking_end": end_idx + len(end_tag)
+                    })
+            except Exception as e:
+                _log.debug(f"处理SFT样本失败: {e}")
+                pass
+            if len(sft_messages_list) >= pure_target and len(sft_full_texts) >= full_target:
+                break
+        if skipped_long:
+            _log.info(
+                f"⚠️ SFT样本长度限制：跳过 {skipped_long} 条超过 {sft_max_tokens} tokens 的样本"
+            )
+        if len(sft_messages_list) < pure_target or len(sft_full_texts) < full_target:
+            raise ValueError(
+                f"SFT长度过滤后数量不足：纯SFT需要 {pure_target} 条（当前 {len(sft_messages_list)} 条），"
+                f"夹心需要 {full_target} 条（当前 {len(sft_full_texts)} 条）。"
+            )
+        _log.info(
+            f"✅ SFT抽样完成：纯SFT {len(sft_messages_list)} 条，夹心用 {len(sft_full_texts)} 条，"
+            f"共处理 {processed} 条原始样本。"
+        )
+        return sft_full_texts, sft_messages_list
     
     def _build_simple_sft_batch(self, processor, messages: List[List[Dict[str, Any]]]):
         """
@@ -1973,86 +2054,6 @@ class MemoryTrainingService:
                 guide_text=self.guide_text,
             )
 
-            # 加载SFT数据并提取完整内容（截断点将在思考部分内部）
-            sft_full_texts = []
-            sft_messages_list = []  # 用于混合训练的SFT消息列表
-            sft_max_tokens = int(self.training_config.get("sft_max_tokens") or 0)
-            if self.sft_enabled and self.sft_path:
-                try:
-                    # 需要processor来将messages转换为文本
-                    from transformers import AutoProcessor
-                    processor = AutoProcessor.from_pretrained(
-                        model_path,
-                        trust_remote_code=True,
-                        local_files_only=True
-                    )
-                    
-                    sft_samples = self._load_sft_dataset()
-                    skipped_long_sft = 0
-                    total_sft_candidates = 0
-                    for sample in sft_samples:
-                        messages = self._standardize_sft_messages(sample)
-                        if not messages:
-                            continue
-                        total_sft_candidates += 1
-                        if sft_max_tokens:
-                            within_limit, seq_len = self._is_sft_within_token_limit(
-                                processor,
-                                messages,
-                                sft_max_tokens,
-                                add_generation_prompt=False,
-                                desc="混合训练SFT"
-                            )
-                            if not within_limit:
-                                skipped_long_sft += 1
-                                continue
-                        # 保存标准化的messages用于混合训练
-                        sft_messages_list.append(messages)
-                        
-                        # 使用processor将messages转换为完整文本（包括所有消息）
-                        try:
-                            # 使用apply_chat_template转换为文本格式
-                            full_text = processor.apply_chat_template(
-                                messages,
-                                tokenize=False,
-                                add_generation_prompt=False
-                            )
-                            
-                            # 检查是否包含思考部分
-                            start_tag = "<think>"
-                            end_tag = "</think>"
-                            start_idx = full_text.find(start_tag)
-                            end_idx = full_text.find(end_tag)
-                            
-                            if start_idx != -1 and end_idx != -1:
-                                # 找到思考部分，保存完整文本和思考部分的起止位置
-                                # 注意：这里保存的是完整文本，截断会在训练时进行
-                                sft_full_texts.append({
-                                    "full_text": full_text,
-                                    "thinking_start": start_idx,
-                                    "thinking_end": end_idx + len(end_tag)
-                                })
-                        except Exception as e:
-                            _log.debug(f"处理SFT样本失败: {e}")
-                            continue
-                    
-                    if skipped_long_sft:
-                        _log.info(
-                            f"⚠️ SFT样本长度限制：跳过 {skipped_long_sft}/{total_sft_candidates} 条超过 {sft_max_tokens} tokens 的样本"
-                        )
-                    
-                    if sft_messages_list:
-                        _log.info(
-                            f"✅ 从SFT数据中提取了 {len(sft_full_texts)} 条完整文本，"
-                            f"{len(sft_messages_list)} 条消息，截断点将控制在思考部分内部"
-                        )
-                    else:
-                        raise ValueError(
-                            "所有SFT样本因长度限制或解析失败被跳过，无法满足训练所需的SFT数量。"
-                        )
-                except Exception as e:
-                    _log.warning(f"⚠️ 加载SFT数据失败，将使用记忆条目作为上下文: {e}")
-
             # 训练
             memory_epochs = self.training_config.get("memory_epochs", 20)
             batch_size = self.training_config.get("batch_size", 4)
@@ -2065,6 +2066,16 @@ class MemoryTrainingService:
             training_data = torch.load(temp_data_path, map_location='cpu')
             memory_texts = training_data.get('texts', [])
             self._current_epoch_sample_n = len(memory_texts)
+            sft_full_texts = []
+            sft_messages_list = []
+            if memory_texts:
+                pure_target = max(1, len(memory_texts) // 2)
+                full_target = len(memory_texts) // 2
+                sft_full_texts, sft_messages_list = self._load_sft_messages_with_target(
+                    model_path,
+                    pure_target,
+                    full_target
+                )
             if self.sft_enabled and self.sft_path and memory_texts:
                 memory_count = len(memory_texts)
                 memory_full_count = memory_count // 2
