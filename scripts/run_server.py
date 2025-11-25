@@ -62,10 +62,10 @@ def main():
         print("=" * 60)
         print("按 Ctrl+C 停止服务器")
         print("=" * 60)
-        
+
         # 启动服务器
         app.run(host=host, port=port, debug=False, threaded=True)
-        
+
     except Exception as e:
         print(f"❌ 服务器启动失败: {e}")
         import traceback
