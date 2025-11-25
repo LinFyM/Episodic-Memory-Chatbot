@@ -39,7 +39,7 @@
 
 **流程**：
 1. 加载 `temp_sft_vectors.pt`，获取 `sft_texts` 和 `sft_embeddings`
-2. 随机抽取 `actual_sft_count = min(required_sft_count, len(sft_texts))` 条向量
+2. 随机抽取 `required_sft_count` 条向量（如果向量文件中的数量不足，会在提取阶段抛错，所以这里不需要min）
 3. 与记忆条目向量合并，形成训练数据
 4. **不再进行token长度校验**（已在提取阶段完成）
 
@@ -60,13 +60,15 @@
    - 保存为 `standardized_sft_samples`，每个元素包含：
      - `messages`：标准化后的消息列表
      - `index`：在原始数据集中的索引
-3. **创建采样器函数**：`_epoch_sampler(pure_target, full_target)`
+3. **创建采样器函数**：`_epoch_sampler(total_target)`
    - 闭包捕获 `standardized_sft_samples`、`preloaded_processor`、`sft_max_tokens`
    - 返回一个可调用对象，供每个epoch调用
+   - **注意**：只保存标准化后的messages和索引，不占用显存（文本数据在内存中）
 
 **关键点**：
 - ✅ **不预抽取**：只准备采样器，不提前抽取数据
 - ✅ **保留原始索引**：每个标准化样本都记录其在原始数据集中的位置，用于日志追踪
+- ✅ **显存占用优化**：只保存标准化后的messages（文本数据）和索引（整数），不占用显存。110000条样本的messages和索引只占用内存，不会导致显存问题
 
 ### 2. 每个epoch的SFT抽样（训练中）
 
@@ -77,9 +79,8 @@
 **流程**：
 1. **调用采样器**：
    ```python
-   sampled_full_texts, sampled_messages, msg_sources, full_sources = self.sft_epoch_sampler(
-       pure_target=memory_count // 2,  # 纯SFT目标数量
-       full_target=memory_count // 2    # 夹心SFT目标数量
+   sampled_full_texts, sampled_messages, all_sources = self.sft_epoch_sampler(
+       total_target=int(memory_count * 1.5)  # 抽取1.5倍记忆条目数量的SFT样本
    )
    ```
 2. **采样器内部执行**（`_sample_sft_for_epoch()`）：
@@ -89,59 +90,43 @@
      - **Token长度校验**：
        - 调用 `_is_sft_within_token_limit()` 检查messages的token数
        - 如果超过 `sft_max_tokens`，**跳过该样本，继续下一个**
-     - **分别收集两类样本**：
-       - 纯SFT：如果 `len(selected_messages) < pure_target`，添加到 `selected_messages`
-       - 夹心SFT：如果 `len(selected_full_texts) < full_target`，提取完整文本（包含`<think>`段）并添加到 `selected_full_texts`
-     - 当两类样本都达到目标数量时，**停止遍历**
+     - **收集样本**：
+       - 将messages添加到 `selected_messages`
+       - 提取完整文本（包含`<think>`段），如果存在则添加到 `selected_full_texts`，否则添加 `None`
+       - 记录原始索引到 `selected_message_sources`
+     - 当收集数量达到 `total_target` 时，**停止遍历**
    - **数量校验**：如果最终数量不足，抛出 `ValueError`
-   - 返回：`(selected_full_texts, selected_messages, selected_message_sources, selected_full_sources)`
-3. **更新数据集**：
-   - `self.sft_messages_list = sampled_messages`（纯SFT样本）
-   - `self.memory_dataset.sft_full_texts = sampled_full_texts`（夹心SFT样本）
+   - 返回：`(selected_full_texts, selected_messages, selected_message_sources)`
+3. **三等分SFT样本**：
+   - 将抽到的 `total_target` 条样本三等分：
+     - **前缀SFT**：前1/3，用于记忆-前置训练
+     - **夹心SFT**：中1/3，用于记忆-前后拼接训练（需要完整文本）
+     - **纯SFT**：后1/3，用于纯SFT训练
+4. **更新数据集**：
+   - `self.sft_messages_list = prefix_messages + pure_messages`（前缀和纯SFT都用messages）
+   - `self.memory_dataset.sft_full_texts = middle_full_texts`（夹心SFT的完整文本）
    - 保存原始索引：`self.current_sft_msg_source_indices`、`self.current_sft_full_source_indices`
-4. **构造混合训练样本**：
-   - 记忆-前置：16条（记忆条目 + 随机SFT前缀）
-   - 记忆-前后拼接：16条（记忆条目 + SFT前缀 + SFT后缀，从 `sft_full_texts` 中抽取）
-   - 纯SFT：16条（从 `sft_messages_list` 中抽取）
+5. **构造混合训练样本**：
+   - 记忆-前置：记忆条目的1/3 + 前缀SFT（从 `prefix_messages` 中抽取）
+   - 记忆-前后拼接：记忆条目的1/3 + 夹心SFT（从 `middle_full_texts` 中抽取）
+   - 纯SFT：记忆条目的1/3 + 纯SFT（从 `pure_messages` 中抽取）
+   - **随机打散**：所有混合样本构造完成后，调用 `random.shuffle(self.mixed_indices)` 打散顺序
 
 **关键点**：
 - ✅ **每个epoch重新抽样**：每次调用 `refresh_epoch_data()` 都会从原始数据集中重新随机抽取
 - ✅ **递归补充机制**：如果某条样本超长被跳过，会继续从剩余样本中抽取，直到凑够目标数量
 - ✅ **原始索引追踪**：日志中会显示每个样本在原始数据集中的真实索引，便于验证随机性
 
-### 3. 额外SFT训练（每个epoch结束后）
-
-**位置**：`src/training/training_service.py::_run_sft_one_epoch()`
-
-**执行时机**：每个epoch训练结束后，如果配置了 `sft_per_epoch=True`，会插入额外的SFT训练。
-
-**流程**：
-1. **加载原始数据集**：调用 `_load_sft_dataset()` 加载所有SFT样本
-2. **标准化 + Token过滤**：
-   - 遍历所有样本，标准化messages
-   - **Token长度校验**：如果超过 `sft_max_tokens`，跳过该样本
-   - 收集所有合格的样本到 `standardized_samples`
-3. **随机抽样**：
-   - 使用epoch编号改变随机种子：`random.seed(self.sft_seed + epoch)`
-   - 从 `standardized_samples` 中随机抽取 `sample_n = min(epoch_sample_n, len(standardized_samples))` 条
-4. **批量训练**：将抽取的SFT样本按batch_size分组，进行训练
-
-**关键点**：
-- ✅ **每个epoch重新加载**：每次都会重新加载原始数据集并过滤
-- ✅ **Token限制**：在标准化阶段就过滤掉超长样本
-- ✅ **随机种子变化**：每个epoch使用不同的随机种子，确保抽取不同的样本
-
 ---
 
 ## 总结对比
 
-| 阶段 | 执行时机 | 数据来源 | Token限制 | 递归补充 | 原始索引追踪 |
-|------|---------|---------|-----------|---------|-------------|
-| **第一步：向量提取** | 训练前一次 | 原始SFT数据集 | ✅ 提取时校验 | ✅ 是 | ❌ 否 |
-| **第一步：训练使用** | 训练时 | 已提取的向量文件 | ❌ 无需（已过滤） | ❌ 否 | ❌ 否 |
-| **第二步：采样器初始化** | 训练前一次 | 原始SFT数据集 | ❌ 仅标准化 | ❌ 否 | ✅ 是 |
-| **第二步：每个epoch抽样** | 每个epoch开始 | 标准化样本池 | ✅ 抽样时校验 | ✅ 是 | ✅ 是 |
-| **第二步：额外SFT训练** | 每个epoch结束 | 原始SFT数据集 | ✅ 加载时过滤 | ❌ 否 | ❌ 否 |
+| 阶段 | 执行时机 | 数据来源 | Token限制 | 递归补充 | 原始索引追踪 | 随机打散 |
+|------|---------|---------|-----------|---------|-------------|---------|
+| **第一步：向量提取** | 训练前一次 | 原始SFT数据集 | ✅ 提取时校验 | ✅ 是 | ❌ 否 | ❌ 否 |
+| **第一步：训练使用** | 训练时 | 已提取的向量文件 | ❌ 无需（已过滤） | ❌ 否 | ❌ 否 | ✅ 是（合并后） |
+| **第二步：采样器初始化** | 训练前一次 | 原始SFT数据集 | ❌ 仅标准化 | ❌ 否 | ✅ 是 | ❌ 否 |
+| **第二步：每个epoch抽样** | 每个epoch开始 | 标准化样本池 | ✅ 抽样时校验 | ✅ 是 | ✅ 是 | ✅ 是（三等分后） |
 
 ## 关键设计原则
 
@@ -155,7 +140,8 @@
 
 3. **随机性保证**：
    - 每次抽样前都会 `random.shuffle()` 打乱顺序
-   - 每个epoch使用不同的随机种子（额外SFT训练）
+   - 每个epoch重新从原始数据集中抽样，确保不同epoch使用不同样本
+   - 混合样本构造完成后，会再次 `random.shuffle()` 打散顺序，确保训练时不同类型样本随机出现
    - 日志中显示原始索引，便于验证随机性
 
 4. **原始索引追踪**：

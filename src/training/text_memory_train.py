@@ -587,27 +587,40 @@ class MixedMemorySFTDataset(Dataset):
         memory_count = len(self.memory_texts)
 
         if self.sft_epoch_sampler is not None:
-            pure_target = memory_count // 2
+            # 抽取1.5倍记忆条目数量的SFT样本（都满足长度限制）
+            total_sft_target = int(memory_count * 1.5)
             if memory_count == 1:
-                pure_target = 1
-            if pure_target <= 0:
-                pure_target = min(self.default_sft_only_target, self.sft_epoch_sampler_total or self.default_sft_only_target)
-            full_target = memory_count // 2
+                total_sft_target = 2
             try:
-                sampled_full_texts, sampled_messages, msg_sources, full_sources = self.sft_epoch_sampler(
-                    pure_target,
-                    full_target
+                sampled_full_texts, sampled_messages, all_sources = self.sft_epoch_sampler(
+                    total_sft_target
                 )
             except Exception as sampler_error:
                 raise RuntimeError(f"SFT抽样失败: {sampler_error}")
-            self.sft_messages_list = sampled_messages
-            if sampled_full_texts:
-                self.memory_dataset.sft_full_texts = sampled_full_texts
-            self.current_sft_msg_source_indices = msg_sources
-            self.current_sft_full_source_indices = full_sources
+            # 三等分：前缀SFT、夹心SFT、纯SFT
+            third_count = total_sft_target // 3
+            prefix_messages = sampled_messages[:third_count]
+            prefix_sources = all_sources[:third_count]
+            middle_start = third_count
+            middle_end = third_count * 2
+            middle_messages = sampled_messages[middle_start:middle_end]
+            middle_full_texts = [ft for ft in sampled_full_texts[middle_start:middle_end] if ft is not None]
+            middle_sources = all_sources[middle_start:middle_end]
+            pure_messages = sampled_messages[middle_end:]
+            pure_sources = all_sources[middle_end:]
+            # 保存用于不同类型训练
+            self.sft_messages_list = prefix_messages + pure_messages  # 前缀和纯SFT都用messages
+            if middle_full_texts:
+                self.memory_dataset.sft_full_texts = middle_full_texts
+            self.current_sft_msg_source_indices = prefix_sources + pure_sources
+            self.current_sft_full_source_indices = middle_sources
+            self.prefix_sft_count = len(prefix_messages)
+            self.pure_sft_count = len(pure_messages)
         else:
             self.current_sft_msg_source_indices = []
             self.current_sft_full_source_indices = []
+            self.prefix_sft_count = 0
+            self.pure_sft_count = 0
 
         sft_count = len(self.sft_messages_list)
         
@@ -617,33 +630,43 @@ class MixedMemorySFTDataset(Dataset):
         if memory_count > 0:
             memory_indices = list(range(memory_count))
             random.shuffle(memory_indices)
-            memory_full_count = memory_count // 2  # 需要在尾部拼接SFT的记忆数量
-            memory_front_count = memory_count - memory_full_count
+            # 三等分记忆条目
+            third_count = memory_count // 3
+            memory_front_indices = memory_indices[:third_count]  # 前缀SFT
+            memory_full_indices = memory_indices[third_count:third_count*2]  # 夹心SFT
+            # 剩余的记忆条目也作为前缀SFT处理（如果memory_count不是3的倍数）
+            if memory_count > third_count * 2:
+                memory_front_indices.extend(memory_indices[third_count*2:])
             
-            # 记忆类型A：仅前置SFT
-            for idx in memory_indices[:memory_front_count]:
-                self.mixed_indices.append(('memory_front', idx, None))
+            # 记忆类型A：仅前置SFT（使用prefix_messages）
+            prefix_sft_count = getattr(self, 'prefix_sft_count', 0)
+            if prefix_sft_count > 0 and len(memory_front_indices) > 0:
+                prefix_sft_indices = list(range(min(prefix_sft_count, len(memory_front_indices))))
+                random.shuffle(prefix_sft_indices)
+                for mem_idx, sft_idx in zip(memory_front_indices[:len(prefix_sft_indices)], prefix_sft_indices):
+                    self.mixed_indices.append(('memory_front', mem_idx, sft_idx))
             
-            # 记忆类型B：前置+后置SFT
+            # 记忆类型B：前置+后置SFT（使用middle_full_texts）
+            memory_full_count = len(memory_full_indices)
             if len(self.memory_dataset.sft_full_texts) > 0 and memory_full_count > 0:
-                sft_full_indices = self._sample_indices(len(self.memory_dataset.sft_full_texts), memory_full_count)
-                for mem_idx, sft_idx in zip(memory_indices[memory_front_count:], sft_full_indices):
+                middle_sft_indices = list(range(len(self.memory_dataset.sft_full_texts)))
+                random.shuffle(middle_sft_indices)
+                for mem_idx, sft_idx in zip(memory_full_indices, middle_sft_indices[:memory_full_count]):
                     self.mixed_indices.append(('memory_full', mem_idx, sft_idx))
-                self.last_sft_full_indices = sft_full_indices[:]
+                self.last_sft_full_indices = middle_sft_indices[:memory_full_count]
             else:
-                for idx in memory_indices[memory_front_count:]:
-                    self.mixed_indices.append(('memory_front', idx, None))
                 self.last_sft_full_indices = []
             
-            # 纯SFT样本（数量为记忆条目的一半，向下取整，至少为1）
-            sft_only_target = memory_count // 2
-            if memory_count == 1:
-                sft_only_target = 1
-            if sft_count > 0 and sft_only_target > 0:
-                sft_only_indices = self._sample_indices(sft_count, sft_only_target)
-                for sft_idx in sft_only_indices:
-                    self.mixed_indices.append(('sft', sft_idx, None))
-                self.last_sft_only_indices = sft_only_indices[:]
+            # 纯SFT样本（使用pure_messages，在sft_messages_list中从prefix_sft_count开始）
+            pure_sft_count = getattr(self, 'pure_sft_count', 0)
+            if pure_sft_count > 0:
+                pure_sft_indices = list(range(pure_sft_count))
+                random.shuffle(pure_sft_indices)
+                for sft_idx in pure_sft_indices:
+                    # 在sft_messages_list中，pure_messages从prefix_sft_count开始
+                    actual_idx = prefix_sft_count + sft_idx
+                    self.mixed_indices.append(('sft', actual_idx, None))
+                self.last_sft_only_indices = [prefix_sft_count + i for i in pure_sft_indices]
             else:
                 self.last_sft_only_indices = []
         else:

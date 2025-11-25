@@ -1007,17 +1007,24 @@ class MemoryTrainingService:
         sample_records: List[Dict[str, Any]],
         processor,
         max_tokens: int,
-        pure_target: int,
-        full_target: int
-    ) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]], List[int], List[int]]:
-        if not sample_records or (pure_target <= 0 and full_target <= 0):
-            return [], [], [], []
+        total_target: int
+    ) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]], List[int]]:
+        """
+        从标准化SFT样本中抽取total_target条满足长度限制的样本
+        
+        Returns:
+            (selected_full_texts, selected_messages, selected_sources)
+            - selected_full_texts: 包含<think>段的完整文本（用于夹心训练）
+            - selected_messages: 标准化的messages（用于纯SFT和前缀训练）
+            - selected_sources: 原始数据集索引
+        """
+        if not sample_records or total_target <= 0:
+            return [], [], []
         candidate_indices = list(range(len(sample_records)))
         random.shuffle(candidate_indices)
         selected_messages: List[List[Dict[str, Any]]] = []
         selected_message_sources: List[int] = []
         selected_full_texts: List[Dict[str, Any]] = []
-        selected_full_sources: List[int] = []
         for idx in candidate_indices:
             record = sample_records[idx]
             messages = record["messages"]
@@ -1032,41 +1039,37 @@ class MemoryTrainingService:
                 )
                 if not within_limit:
                     continue
-            if pure_target > 0 and len(selected_messages) < pure_target:
-                selected_messages.append(messages)
-                selected_message_sources.append(origin_index)
-            if full_target > 0 and len(selected_full_texts) < full_target:
-                try:
-                    full_text = processor.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=False
-                    )
-                    start_tag = "<think>"
-                    end_tag = "</think>"
-                    start_idx = full_text.find(start_tag)
-                    end_idx = full_text.find(end_tag)
-                    if start_idx != -1 and end_idx != -1:
-                        selected_full_texts.append({
-                            "full_text": full_text,
-                            "thinking_start": start_idx,
-                            "thinking_end": end_idx + len(end_tag)
-                        })
-                        selected_full_sources.append(origin_index)
-                except Exception as e:
-                    _log.debug(f"处理SFT样本失败: {e}")
-            if (pure_target <= 0 or len(selected_messages) >= pure_target) and (
-                full_target <= 0 or len(selected_full_texts) >= full_target
-            ):
+            selected_messages.append(messages)
+            selected_message_sources.append(origin_index)
+            try:
+                full_text = processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                start_tag = "<think>"
+                end_tag = "</think>"
+                start_idx = full_text.find(start_tag)
+                end_idx = full_text.find(end_tag)
+                if start_idx != -1 and end_idx != -1:
+                    selected_full_texts.append({
+                        "full_text": full_text,
+                        "thinking_start": start_idx,
+                        "thinking_end": end_idx + len(end_tag)
+                    })
+                else:
+                    selected_full_texts.append(None)
+            except Exception as e:
+                _log.debug(f"处理SFT样本失败: {e}")
+                selected_full_texts.append(None)
+            if len(selected_messages) >= total_target:
                 break
-        need_pure = pure_target > 0 and len(selected_messages) < pure_target
-        need_full = full_target > 0 and len(selected_full_texts) < full_target
-        if need_pure or need_full:
+        if len(selected_messages) < total_target:
             raise ValueError(
-                f"SFT抽样不足：纯SFT目标 {pure_target} / 实际 {len(selected_messages)}，"
-                f"夹心目标 {full_target} / 实际 {len(selected_full_texts)}。"
+                f"SFT抽样不足：需要 {total_target} 条满足长度限制的样本，"
+                f"但仅收集到 {len(selected_messages)} 条。"
             )
-        return selected_full_texts, selected_messages, selected_message_sources, selected_full_sources
+        return selected_full_texts, selected_messages, selected_message_sources
     
     def _build_simple_sft_batch(self, processor, messages: List[List[Dict[str, Any]]]):
         """
@@ -1146,164 +1149,6 @@ class MemoryTrainingService:
         labels = torch.stack(padded_labels)
         
         return input_ids, attention_mask, labels
-    
-    def _run_sft_one_epoch(self, trainer_obj, epoch: int, epoch_sample_n: int):
-        """使用训练阶段的LoRA模型，跑1个epoch的通用SFT（重建优化器，权重连续累积）
-        
-        Args:
-            trainer_obj: 训练器对象
-            epoch: 当前epoch编号（用于改变随机种子，确保每次采样不同）
-            epoch_sample_n: 采样数量（与记忆条目数量相同）
-        """
-        if not self.sft_enabled or not self.sft_per_epoch:
-            return
-        try:
-            # 在SFT训练前，清理记忆训练可能残留的显存
-            import torch
-            import gc
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-            _log.debug("🧹 SFT训练前已清理显存缓存")
-            
-            # 取出句柄
-            handles = getattr(trainer_obj, "expose_training_handles", None)
-            if not callable(handles):
-                _log.warning("⚠️ 训练器未暴露expose_training_handles，跳过本次SFT")
-                return
-            handle = trainer_obj.expose_training_handles()
-            model = handle.get("model") or handle.get("base_model")
-            tokenizer = handle.get("tokenizer")
-            accelerator = handle.get("accelerator", None)
-            grad_acc_steps = getattr(trainer_obj, "gradient_accumulation_steps", 1)
-            if model is None or tokenizer is None:
-                _log.warning("⚠️ SFT句柄缺失，跳过")
-                return
-            # 加载样本并按长度过滤
-            all_samples = self._load_sft_dataset()
-            if not all_samples:
-                _log.warning("⚠️ 无SFT数据，跳过")
-                return
-            sft_max_tokens = int(self.training_config.get("sft_max_tokens") or 0)
-            standardized_samples: List[List[Dict[str, Any]]] = []
-            skipped_long = 0
-            for sample in all_samples:
-                m = self._standardize_sft_messages(sample)
-                if not m:
-                    continue
-                if sft_max_tokens:
-                    within_limit, seq_len = self._is_sft_within_token_limit(
-                        tokenizer,
-                        m,
-                        sft_max_tokens,
-                        add_generation_prompt=False,
-                        desc="SFT训练"
-                    )
-                    if not within_limit:
-                        skipped_long += 1
-                        continue
-                standardized_samples.append(m)
-            if skipped_long:
-                _log.info(f"⚠️ SFT长度限制：跳过 {skipped_long} 条超过 {sft_max_tokens} tokens 的样本")
-            if not standardized_samples:
-                _log.warning("⚠️ 无符合长度限制的SFT样本，跳过本次SFT训练")
-                return
-            # 使用epoch编号来改变随机种子，确保每个epoch采样不同的样本
-            random.seed(self.sft_seed + epoch)
-            target_n = epoch_sample_n if epoch_sample_n else len(standardized_samples)
-            if self.sft_max_per_epoch is not None:
-                target_n = min(target_n, int(self.sft_max_per_epoch))
-            if target_n <= 0:
-                _log.warning("⚠️ SFT采样数量为0，跳过")
-                return
-            if len(standardized_samples) < target_n:
-                raise ValueError(
-                    f"SFT样本不足：需要 {target_n} 条满足长度限制的样本，"
-                    f"但仅有 {len(standardized_samples)} 条可用。"
-                )
-            std_msgs = random.sample(standardized_samples, target_n)
-            # 获取SFT训练的batch_size（默认为1，保持向后兼容）
-            sft_batch_size = self.training_config.get("sft_batch_size", 1)
-            _log.info(f"🧪 本epoch插入SFT: {len(std_msgs)} 条 (batch_size={sft_batch_size})")
-
-            # 构建小批数据
-            model.train()
-            optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=float(self.training_config.get("learning_rate", 1e-4)))
-            accumulation = 0
-            total_loss = 0.0
-            steps = 0
-
-            # 使用tqdm进度条
-            try:
-                from tqdm import tqdm
-                use_tqdm = True
-            except ImportError:
-                use_tqdm = False
-                progress_interval = max(1, len(std_msgs) // 10)  # 每10%打印一次进度
-
-            if use_tqdm:
-                pbar = tqdm(total=len(std_msgs), desc="🧪 SFT训练", unit="样本")
-
-            # 按batch_size分组处理
-            for i in range(0, len(std_msgs), sft_batch_size):
-                batch_end = min(i + sft_batch_size, len(std_msgs))
-                batch_msgs = std_msgs[i:batch_end]
-                actual_batch_size = len(batch_msgs)
-
-                input_ids, attention_mask, labels = self._build_simple_sft_batch(tokenizer, batch_msgs)
-                device = next(model.parameters()).device
-                input_ids = input_ids.to(device)
-                attention_mask = attention_mask.to(device)
-                labels = labels.to(device)
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss / grad_acc_steps
-                if accelerator is not None:
-                    accelerator.backward(loss)
-                else:
-                    loss.backward()
-                accumulation += 1
-                if accumulation % grad_acc_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optim.step()
-                    optim.zero_grad()
-                    steps += 1
-                    total_loss += loss.item() * grad_acc_steps
-
-                    # 更新进度条或打印进度
-                    if use_tqdm:
-                        pbar.update(actual_batch_size)
-                        pbar.set_postfix({'loss': f'{total_loss/steps:.4f}'})
-                    else:
-                        # 打印进度（兼容没有tqdm的情况）
-                        if steps % progress_interval == 0 or steps == (len(std_msgs) // grad_acc_steps + 1):
-                            progress = (steps * grad_acc_steps) / len(std_msgs) * 100
-                            avg_loss_so_far = total_loss / steps
-                            _log.info(f"🧪 SFT进度: {progress:.1f}% ({steps * grad_acc_steps}/{len(std_msgs)}), 当前loss={avg_loss_so_far:.6f}")
-
-            if accumulation % grad_acc_steps != 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optim.step()
-                optim.zero_grad()
-                steps += 1
-                total_loss += loss.item() * grad_acc_steps
-
-            if use_tqdm:
-                pbar.close()
-
-            avg_loss = total_loss / max(steps, 1)
-            _log.info(f"✅ 本epoch SFT完成，avg_loss={avg_loss:.6f}, steps={steps}")
-            
-            # SFT训练结束后，清理SFT数据以释放显存，为下一个epoch的记忆训练做准备
-            import torch
-            import gc
-            # 清理SFT训练中创建的tensor
-            del input_ids, attention_mask, labels, outputs, loss
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-            _log.debug("🧹 SFT训练后已清理显存缓存")
-        except Exception as e:
-            _log.warning(f"⚠️ SFT执行失败，已跳过: {e}", exc_info=True)
     
     def save_memory_chat_histories_to_storage(self):
         """
@@ -2034,7 +1879,6 @@ class MemoryTrainingService:
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 max_memory=max_memory,
                 generation_config=self.config.get("generation", {}),
-                epoch_end_hook=(lambda ep, tr: self._run_sft_one_epoch(tr, epoch=ep, epoch_sample_n=self._current_epoch_sample_n)),
                 lora_target_modules=step2_lora_target_modules,
                 dataset_max_length=dataset_max_length,
                 test_sample_count=test_sample_count,
@@ -2075,13 +1919,12 @@ class MemoryTrainingService:
                             })
                     sft_epoch_sampler_total = len(standardized_sft_samples)
                     if standardized_sft_samples:
-                        def _epoch_sampler(pure_target: int, full_target: int):
+                        def _epoch_sampler(total_target: int):
                             return self._sample_sft_for_epoch(
                                 standardized_sft_samples,
                                 preloaded_processor,
                                 sft_max_tokens,
-                                pure_target,
-                                full_target
+                                total_target
                             )
                         sft_epoch_sampler = _epoch_sampler
                 except Exception as sampler_error:
