@@ -1856,11 +1856,14 @@ class EnhancedTextMemoryTrainer:
         recall_token_count = len(recall_tokens)
         
         # 为了测试模型在真实场景下的表现，测试时也应该有上下文
-        # 使用和训练时一样的上下文处理方式：优先从SFT数据中随机选择并截断，如果没有则从记忆条目中选择
+        # 使用和训练时一样的上下文处理方式：必须从SFT数据中随机选择并截断
         test_context_text = ""
         
-        # 如果提供了SFT数据，使用和训练时一样的截断方式
-        if sft_full_texts and len(sft_full_texts) > 0:
+        # 必须提供SFT数据，测试时应该和训练时使用相同的上下文来源
+        if not sft_full_texts or len(sft_full_texts) == 0:
+            print("⚠️ 警告: 测试时未提供SFT数据，无法使用SFT截断文本作为上下文")
+            print("   测试将使用空上下文，这可能影响测试结果的准确性")
+        else:
             import random
             # 取一个安全的embedding样本（tensor/list都可）
             def _pick_one_embedding(embs):
@@ -1903,14 +1906,16 @@ class EnhancedTextMemoryTrainer:
             )
             # 使用和训练时一样的截断方法
             test_context_text, _ = temp_dataset_for_context._split_sft_at_thinking(sft_data)
-        
-        # 如果没有SFT数据，从记忆条目中随机选择上下文（和训练时一样）
-        if not test_context_text and len(texts) > 1:
-            import random
-            other_indices = [i for i in range(len(texts)) if i not in test_indices]
-            if other_indices:
-                context_idx = random.choice(other_indices)
-                test_context_text = texts[context_idx]
+            
+            # 如果截断后为空，尝试使用完整的SFT文本（去掉thinking部分）
+            if not test_context_text or not test_context_text.strip():
+                full_text = sft_data.get("full_text", "")
+                thinking_start = sft_data.get("thinking_start", 0)
+                if thinking_start > 0:
+                    test_context_text = full_text[:thinking_start].strip()
+                else:
+                    # 如果找不到thinking部分，使用前一半文本作为上下文
+                    test_context_text = full_text[:len(full_text)//2].strip()
         
         # 测试时使用固定的激活提示语（使用第一个，确保测试一致性）
         test_activation_prompt = self.activation_prompts[0].strip() if self.activation_prompts else ""
@@ -1924,17 +1929,15 @@ class EnhancedTextMemoryTrainer:
         
         # 构造完整输入序列
         full_input_tokens = context_tokens + activation_tokens + core_input_tokens
-        # embedding插入位置：在<recall>之后，也就是<|memory_pad|>的位置
-        embedding_position = len(context_tokens) + len(activation_tokens) + recall_token_count
+        # embedding插入位置：必须是<|memory_pad|>的位置，也就是序列的最后一个位置
+        # 直接使用最后一个位置，确保正确
+        embedding_position = len(full_input_tokens) - 1
         
-        # 验证embedding位置是否正确（应该是<|memory_pad|>的位置，也就是最后一个位置）
-        expected_embedding_pos = len(full_input_tokens) - 1
-        if embedding_position != expected_embedding_pos:
-            print(f"⚠️ 警告: embedding位置计算可能有问题")
-            print(f"   计算的位置: {embedding_position}, 期望的位置（最后一个）: {expected_embedding_pos}")
-            print(f"   输入序列: {full_input_tokens}")
-            # 使用期望的位置
-            embedding_position = expected_embedding_pos
+        # 验证：<|memory_pad|>应该在最后一个位置
+        if len(full_input_tokens) > 0 and full_input_tokens[-1] != memory_pad_id:
+            print(f"⚠️ 警告: <|memory_pad|>不在最后一个位置")
+            print(f"   最后一个token ID: {full_input_tokens[-1]}, 期望: {memory_pad_id}")
+            print(f"   输入序列长度: {len(full_input_tokens)}")
         
         print(f"📋 测试配置:")
         print(f"   上下文: {'有 (' + str(len(context_tokens)) + ' tokens)' if test_context_text else '无'}")
