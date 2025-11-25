@@ -1929,22 +1929,12 @@ class MemoryTrainingService:
                         sft_epoch_sampler = _epoch_sampler
                 except Exception as sampler_error:
                     _log.warning(f"⚠️ 初始化SFT采样器失败: {sampler_error}")
+            # 注意：sft_messages_list 和 sft_full_texts 现在是空的，因为SFT数据改为每个epoch动态采样
+            # 长度检查会在每个epoch的 refresh_epoch_data 中通过采样器内部进行
+            # 这里只需要确保采样器创建成功即可
             if self.sft_enabled and self.sft_path and memory_texts:
-                memory_count = len(memory_texts)
-                memory_full_count = memory_count // 2
-                sft_only_target = memory_count // 2
-                if memory_count == 1:
-                    sft_only_target = 1
-                if sft_only_target and len(sft_messages_list) < sft_only_target:
-                    raise ValueError(
-                        f"SFT样本不足：需要至少 {sft_only_target} 条用于纯SFT训练，"
-                        f"但仅有 {len(sft_messages_list)} 条符合长度限制。"
-                    )
-                if memory_full_count > 0 and len(sft_full_texts) < memory_full_count:
-                    raise ValueError(
-                        f"SFT完整文本不足：需要至少 {memory_full_count} 条包含<think>的SFT样本，"
-                        f"但仅有 {len(sft_full_texts)} 条满足条件。"
-                    )
+                if sft_epoch_sampler is None:
+                    _log.warning("⚠️ SFT采样器未创建，第二步训练将无法使用SFT数据")
             res2 = trainer.train(
                 pt_file_path=temp_data_path,
                 num_epochs=memory_epochs,
