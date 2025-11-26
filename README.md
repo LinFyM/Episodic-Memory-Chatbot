@@ -138,9 +138,70 @@ memory:
 - **services/**: 媒体、ASR、提取器
 - **utils/**: 工具函数
 
-## License
+## 引用与致谢
 
-MIT
+本项目基于以下开源项目构建，特此致谢：
+
+### 模型与框架
+
+- **[Qwen3-VL](https://github.com/QwenLM/Qwen3-VL)** - 阿里云通义千问团队开发的多模态大语言模型
+  - 本项目使用 Qwen3-VL-4B-Thinking 作为基础模型
+  - 模型许可：请遵循 [Qwen3-VL 的许可协议](https://github.com/QwenLM/Qwen3-VL/blob/main/LICENSE)
+
+- **[Transformers](https://github.com/huggingface/transformers)** - Hugging Face 的模型库
+  - 用于模型加载和推理
+
+- **[PEFT](https://github.com/huggingface/peft)** - Hugging Face 的参数高效微调库
+  - 用于 LoRA 微调训练
+
+### 数据集
+
+- **Chinese-Qwen3-235B-Thinking-2507-Distill-data-110k-SFT** - SFT 训练数据集
+  - 用于模型的有监督微调训练
+
+### QQ 客户端框架
+
+- **[ncatbot](https://github.com/lz1998/ncatbot)** - QQ 机器人 Python SDK
+  - 用于客户端与 QQ 的交互
+
+- **[NapCat](https://github.com/NapNeko/NapCat)** - QQ 协议实现
+  - 提供 WebSocket 接口，用于客户端连接 QQ
+
+### 其他依赖
+
+- **Flask** - Web 框架
+- **APScheduler** - 定时任务调度
+- **ModelScope** - 模型下载与管理
 
 ---
-v2.0 - 全新架构 (2025-11-24)
+
+## License
+
+本项目采用 **MIT License**。
+
+### ⚠️ 重要使用限制
+
+**本项目及其代码、模型、数据集均不允许用于以下用途：**
+
+1. **科学研究**：包括但不限于学术研究、论文发表、实验分析等
+2. **商业用途**：包括但不限于商业产品、服务、盈利性应用等
+3. **任何违反法律法规的用途**
+
+### 许可范围
+
+- ✅ 个人学习与测试
+- ✅ 非商业性的个人项目
+- ✅ 符合法律法规的合法用途
+
+### 模型与数据集许可
+
+本项目使用的模型和数据集遵循其原始许可协议：
+
+- **Qwen3-VL 模型**：请遵循 [Qwen3-VL 许可协议](https://github.com/QwenLM/Qwen3-VL/blob/main/LICENSE)
+- **训练数据集**：请遵循数据集提供方的许可协议
+
+**使用本项目即表示您已阅读、理解并同意遵守上述所有限制和许可条款。**
+
+---
+
+v2.1 - 训练调度优化 (2024-11-26)
