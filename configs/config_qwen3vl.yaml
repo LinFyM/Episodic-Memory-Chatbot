@@ -17,7 +17,7 @@ model:
   # - CPU: "cpu"
   # - 自动分配: "auto"（使用所有可用GPU）
   # 单卡部署：指定单个GPU
-  device: "cuda:3"
+  device: "cuda:7"
   # 多GPU配置（当device为auto或列表时使用）
   multi_gpu:
     enabled: false  # 单卡模式，关闭多GPU
@@ -59,6 +59,8 @@ memory:
   training:
     enabled: true  # 是否启用自动训练
     schedule: "3"  # 训练时间：凌晨3点（只执行一次）
+    first_training_delay_days: 2  # 程序启动后，第x天的凌晨开始第一次训练（例如：2表示启动后第2天的凌晨）
+    training_interval_days: 3  # 训练间隔天数（例如：3表示每3天训练一次）
     base_model_path: "./models/Qwen3-VL-4B-Thinking"  # 基础模型路径（用于训练）
     trained_model_dir: "./models/trained"  # 训练后模型保存目录
     token_added_model_dir: "./models/token_added"  # 添加了token的模型保存目录

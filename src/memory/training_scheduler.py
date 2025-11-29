@@ -117,6 +117,9 @@ class MemoryTrainingScheduler:
             _log.info("记忆训练未启用，跳过调度器启动")
             return
         schedule = memory_config.get("schedule", "3")
+        first_training_delay_days = memory_config.get("first_training_delay_days", 2)
+        training_interval_days = memory_config.get("training_interval_days", 3)
+        
         try:
             try:
                 train_hour = int(schedule)
@@ -133,17 +136,16 @@ class MemoryTrainingScheduler:
             start_date = now.date()  # 只取日期部分
             _log.info(f"📅 进程启动日期: {start_date.strftime('%Y-%m-%d')}")
             
-            # 计算第一次训练时间：启动日期 + 2天，在指定小时
-            first_training_date = start_date + timedelta(days=2)
+            # 计算第一次训练时间：启动日期 + first_training_delay_days 天，在指定小时
+            first_training_date = start_date + timedelta(days=first_training_delay_days)
             first_training_time = datetime.combine(first_training_date, datetime.min.time()).replace(hour=train_hour, minute=0, second=0, microsecond=0)
             
-            # 如果第一次训练时间已经过了（比如启动时间是26日23:00，第一次训练是28日03:00，但现在是29日），
-            # 需要找到下一个训练时间（启动日期+2+3n天）
+            # 如果第一次训练时间已经过了，需要找到下一个训练时间
             if first_training_time <= now:
-                # 从启动日期+2天开始，每次加3天，直到找到未来的训练时间
-                days_to_add = 2
+                # 从启动日期+first_training_delay_days天开始，每次加training_interval_days天，直到找到未来的训练时间
+                days_to_add = first_training_delay_days
                 while True:
-                    days_to_add += 3  # 第一次已经过了，从+5天开始
+                    days_to_add += training_interval_days
                     candidate_date = start_date + timedelta(days=days_to_add)
                     candidate_time = datetime.combine(candidate_date, datetime.min.time()).replace(hour=train_hour, minute=0, second=0, microsecond=0)
                     if candidate_time > now:
@@ -151,14 +153,14 @@ class MemoryTrainingScheduler:
                         break
             
             _log.info(f"📅 第一次训练时间: {first_training_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            _log.info(f"⏰ 训练时间设置：从启动日期算起，每3天在 {train_hour}:00 执行一次训练")
+            _log.info(f"⏰ 训练时间设置：启动后第{first_training_delay_days}天凌晨{train_hour}点开始第一次训练，之后每{training_interval_days}天训练一次")
             
-            # 使用 IntervalTrigger，每3天执行一次，从第一次训练时间开始
+            # 使用 IntervalTrigger，每training_interval_days天执行一次，从第一次训练时间开始
             self.scheduler.add_job(
                 func=self.train_job,
-                trigger=IntervalTrigger(days=3, start_date=first_training_time),
+                trigger=IntervalTrigger(days=training_interval_days, start_date=first_training_time),
                 id='memory_training',
-                name=f'记忆训练任务-每3天{train_hour}点',
+                name=f'记忆训练任务-每{training_interval_days}天{train_hour}点',
                 replace_existing=True
             )
             self.scheduler.start()
