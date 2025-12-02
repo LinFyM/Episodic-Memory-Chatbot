@@ -15,7 +15,7 @@ _log = logging.getLogger(__name__)
 class MemoryVectorDB:
     """记忆向量数据库，只存储embedding向量（不存储文本）"""
     
-    def __init__(self, embedding_dim=4096, device="cpu", max_size: int = 100000, enable_eviction: bool = True):
+    def __init__(self, embedding_dim=2560, device="cpu", max_size: int = 100000, enable_eviction: bool = True):
         """
         初始化向量数据库
         

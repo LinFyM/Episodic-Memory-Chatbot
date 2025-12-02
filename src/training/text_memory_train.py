@@ -61,7 +61,19 @@ def enhanced_collate_fn(batch):
             labels[i, :len(item_labels)] = item_labels
             
             # SFT样本使用占位符embedding，position设为-1表示不需要插入
-            embeddings_to_insert.append(torch.zeros(1, 4096))  # 占位符
+            # 占位符，维度从batch中的记忆条目样本获取，如果没有则使用默认值2560
+            hidden_size = 2560  # 默认值（4B模型的隐藏层大小）
+            # 如果已经有记忆条目样本，从它们的embedding维度推断
+            if embeddings_to_insert:
+                hidden_size = embeddings_to_insert[0].shape[-1]
+            # 如果当前batch中有记忆条目样本，从它们获取维度
+            elif has_memory:
+                # 查找batch中的第一个记忆条目样本
+                for other_item in batch:
+                    if not other_item.get('is_sft', False) and 'embedding_to_insert' in other_item:
+                        hidden_size = other_item['embedding_to_insert'].shape[-1]
+                        break
+            embeddings_to_insert.append(torch.zeros(1, hidden_size))  # 占位符
             embedding_positions.append(-1)  # -1表示SFT样本，不需要插入
         else:
             # 记忆条目样本：原有逻辑
@@ -816,10 +828,11 @@ class MixedMemorySFTDataset(Dataset):
         sequence_tokens = input_ids.clone()
         
         # 获取embedding维度（从模型配置或默认值）
+        # 4B模型默认是2560维，8B模型是4096维
         try:
-            hidden_size = getattr(self.base_model.config, "hidden_size", 4096)
+            hidden_size = getattr(self.base_model.config, "hidden_size", 2560)
         except:
-            hidden_size = 4096
+            hidden_size = 2560
         
         # 返回格式与记忆条目样本一致
         return {

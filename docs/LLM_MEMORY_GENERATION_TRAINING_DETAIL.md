@@ -1,176 +1,253 @@
-# 萝卜子 QQ 机器人自回归记忆生成 & 训练详案（供 LLM 阅读）
+# 自回归记忆统一方案（供 LLM 深度阅读）
 
-> **范围**：仅覆盖在线自回归生成流程（含记忆触发、KV cache 行为）与完整训练流水线（记忆提取 → 向量化 → Mixed Memory + SFT → 两步 LoRA）。排除 API / QQ 客户端层。
-
----
-
-## 1. 在线生成：从历史到输出
-
-### 1.1 Chat History 结构
-- 每条消息记录：
-  ```json
-  {
-    "role": "user" | "assistant",
-    "content": [
-      {"type": "text", "text": "..."},
-      {"type": "image", "image": "http://..."} // 可选
-    ],
-    "timestamp": 17325xxxxx.123
-  }
-  ```
-- 维护逻辑（`chat/history_manager.py`）：
-  - `maintain_chat_history()` 去重（基于 role + timestamp + text），并按 `config.chat_history.max_history_length` 截断。
-  - 超出部分异步写入 `memory.training.chat_history_storage_dir`，供训练阶段使用。
-
-### 1.2 生成入口（`chat/reply_handler.generate_reply`）
-1. **System Prompt 构造**：`chat/prompting.py::build_system_prompt` 汇总角色设定、记忆说明、输出格式等；由 `configs/prompts.yaml` 提供文本模板。
-2. **历史拼接**：`full_messages = [system_prompt] + history`。
-3. **Token 截断**：`truncate_history_by_tokens(processor, chat_history, system_prompt, max_tokens)`：
-   - 调用 `processor.apply_chat_template(..., tokenize=True, add_generation_prompt=True)` 计算当前 token 数。
-   - 若超出 `config.chat_history.max_input_tokens`（默认 32000），按 FIFO 移除历史消息并异步保存被移除段。
-4. **序列化**：再调用一次 `processor.apply_chat_template(..., return_tensors="pt")` 得到 `input_ids`/`attention_mask`，发送给 `custom_generate`。
-
-### 1.3 `custom_generate` 核心流程（`src/chat/generate.py`）
-1. **准备阶段**：
-   - 推导 `logits_processor`（重复惩罚等）、`logits_warper`（来自 `generation` 配置）。
-   - 通过 `_update_model_kwargs_for_generation()` 维护 `past_key_values`。
-2. **循环**（每个 token）：
-   1. **回忆触发检测**：检查 `current_input_ids` 的最后一个 token 是否等于 `<recall>`（`recall_token_id` 由模型 tokenizer 转换），并确保 `memory.autoregressive_recall.enabled=true`。
-   2. **前向传播**：
-      ```python
-      forward_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-      outputs = forward_backbone(model, **forward_inputs, use_cache=True, output_hidden_states=True)
-      last_hidden_state = ensure_last_hidden_state(outputs)
-      ```
-   3. **Memory Head**（若触发）：
-      - query 向量：`query_vector = last_hidden_state[0, -1, :]`（即 `<recall>` 位置的 hidden state）。
-      - `memory_head(query_vector, memory_db)`：
-        - 强制把 `query_vector`、记忆库向量都转 bf16 & L2 normalize（在 `memory/vector_db.py` 中 add 时已 normalize）。
-        - 计算余弦相似度 `torch.matmul(query_normalized, embeddings.T)`，**对所有记忆向量**求分数。
-        - 不做 softmax，只返回 logits（`memory_logits`）与候选列表（包含 embedding / score / index）。
-   4. **记忆 logits 处理**：
-      ```python
-      memory_warper = LogitsProcessorList([
-          TemperatureLogitsWarper(autorecall_temperature),
-          TopKLogitsWarper(autorecall_top_k),
-          TopPLogitsWarper(autorecall_top_p)
-      ])
-      memory_scores = memory_warper(dummy_ids, memory_logits.unsqueeze(0)).squeeze(0)
-      ```
-      - `dummy_ids` 只是placeholder，因为 HF 的 `LogitsProcessor` 需要 input_ids。
-      - 采样或贪婪取 `choice_idx` 取决于 `autorecall_use_sampling`。
-   5. **记忆向量注入**：
-      - 设置 `forced_next_token_id = memory_pad_token_id`，并记录 `memory_injection_positions.append((len(input_ids), memory_score))`。
-      - `override_next_embed = memory_embedding(selected["embedding"], model)`：
-        - reshape 到 `[1,1,hidden_dim]`，同步到模型 dtype/device。
-      - 在下一轮前向时，若 `override_next_embed` 非空，则从 `forward_inputs` 中删 `input_ids`，改传 `inputs_embeds=override_next_embed`（避免 HF 报错“input_ids 与 inputs_embeds 只能选一个”）。
-   6. **普通 token 生成**：
-      - 获取 `outputs.logits[:, -1, :]`，套 `logits_processor` + `logits_warper`。
-      - 若 `forced_next_token_id` 不为空，则绕过采样/贪婪直接输出 `<|memory_pad|>`。
-      - 将新 token append 到 `input_ids`；`model_kwargs` 中的 `past_key_values` 会在 `_update_model_kwargs_helper` 中更新。
-3. **KV Cache 行为**：
-   - 在 `forward_backbone(..., use_cache=True)` 时，HF 初始化 `past_key_values`，尺寸与“输入 token 数 + `max_new_tokens`”有关；由于 `configs.generation.max_new_tokens=40960`，第一次推理时会预留相当大的显存。
-   - 该 cache 由 CUDA allocator 持有，后续即使没有请求也保持占用，以便下一次生成复用。
+> **目标**：将记忆检索机制与标准自回归生成实现“完全对称”的融合，并配套一套能把记忆写入模型的训练体系。本文不讨论任何具体业务场景，只聚焦通用可复用的技术细节。
 
 ---
 
-## 2. 训练流水线
+## 1. 引言：记忆是通往持续智能的必要能力
 
-### 2.1 调度（`memory/training_scheduler.py`）
-1. `train_job()`：
-   - 获取 scheduler 锁 → 设置 `server_state.is_training=True`（API 层会拒绝新消息）。
-   - 调 `MemoryTrainingService.run_training()`，捕获异常 → 释放锁。
-2. 支持 `auto_restart_after_training`：
-   - 若 true，则训练完成后调用 `training_service.cleanup_after_training()`，再根据 `restart_mode`（默认 `restart_server`）启动新的服务进程。
+1. **Yann LeCun 的观点**  
+   - 现代深度学习系统虽然庞大，但本质仍是“函数逼近器”，缺乏可以读写的记忆。  
+   - 若模型无法把新经验写入可检索的存储区，就很难实现持续学习。  
+   - 因此，一个能在自回归过程中“主动读写记忆”的机制，是迈向真正自主系统的关键。
 
-### 2.2 MemoryTrainingService 阶段划分
+2. **Ilya Sutskever 的观点**  
+   - “超级智能应该像永远在学习的 15 岁少年，而不是能执行任意指令的工人。”  
+   - 少年式智能意味着：随时吸收新知识、在对话中调取旧经验，并把结果以自然语言输出。  
+   - 这种行为要求模型在自回归循环内部就能触发记忆检索，而不是依赖外部工具。
 
-#### 阶段 A：准备
-1. `_detect_project_root()`、`_prepare_output_dir()` 等确保目录存在。
-2. `_ensure_training_modules_loaded()` 导入 `text_embedding_train` / `text_memory_train` / `memory_extraction` 等；（此前 `Tuple` 未导入导致 `NameError`，已修复）。
-3. 清理显存：若设置了 `CUDA_VISIBLE_DEVICES`，只清理 `cuda:0`；否则遍历 `torch.cuda.device_count()`。
+3. **现有方案的不足**  
+   | 方案 | 优点 | 典型问题 |
+   | ---- | ---- | -------- |
+   | 额外 SFT 微调 | 结构简单 | 训练成本高；新知识写入慢；推理时无法动态选择记忆 |
+   | RAG | 不改模型参数 | 推理链路复杂；取回的文本难与模型原有思路对齐；需要额外的 prompt 工程 |
 
-#### 阶段 B：记忆提取（`memory_extraction.py`）
-1. **加载聊天历史**：
-   - 从 `memory.training.chat_history_storage_dir` 扫描 `*.json`，各自包含 `{ "messages": [ ... ] }`。
-   - `_standardize_sft_messages` 保留 `role + text`；多模态内容会被保留到 `content` 列表。
-2. **构造多层 prompt**：
-   - System prompt = `prompts.memory_extraction.system_prompt` + role_playing（可选）+ child depth 提示（递归时）。
-   - User prompt：`memory_extraction.user_instruction`（默认“请开始提取记忆条目”）。
-3. **生成记忆文本**：
-   - `processor.apply_chat_template(full_messages, add_generation_prompt=True)` → `model.generate()`（配置 `max_new_tokens` 等）。
-   - `_strip_formal_reply()` 取 `<think>` 之后内容；`_parse_memory_entries()` 过滤出记忆句子。
-4. **写入临时文件**：`_append_memory_text_to_file()` 将文本保存到 `temp_memory_texts.pt`，便于分批处理。
-5. **批量向量化**：
-   - `_batch_extract_embeddings()` 按 `embedding_batch_size`（默认 8）将记忆文本嵌入，使用 `memory_vectorization.summary_prompt_template`。
-   - tokenizer → 模型 forward → `last_token_idx = attention_mask.sum() - 1` → 取 `[layer=last, token=last]` hidden state → detach.cpu()。
-   - 记录 batch 日志，并定期 `torch.cuda.empty_cache()`。
-   - 输出 `texts`, `embeddings`，合并保存到 `temp_training_data.pt`。
-
-#### 阶段 C：两步训练
-
-1. **Recall Token 训练（`text_embedding_train.py`）**
-   - 目标：让 `<recall>` + `<|memory_pad|>` 触发时更稳定，训练数据来自 `temp_training_data.pt`（embedding + 原文本）。
-   - 调用 LoRA 适配，`LoraConfig(step1)` 只挂到 Q/V，减少显存。
-   - 训练完成后保存 LoRA 权重，供下一阶段载入。
-
-2. **Memory Decoding 训练（`text_memory_train.py`）**
-   - **MixedMemorySFTDataset**：
-     - `refresh_epoch_data()` 构造1:1:1索引：
-       ```python
-       half = memory_count // 2
-       # 类型1: memory_front
-       memory_type1_indices = sample(range(memory_count), half)
-       # 类型2: memory_full (夹心)
-       memory_type2_indices = sample(剩余)
-       # 类型3: sft_pure = memory_count
-       sft_pure_indices = sample(range(len(sft)), memory_count)
-       ```
-     - `_get_memory_decode_sample()`：拼 `context_tokens + activation_prompt + <recall> + <|memory_pad|>`，labels 对 `<recall>`、记忆文本、`</recall>`, `end_prompt` 打开；其余为 `-100`。
-     - `_get_sft_sample_with_suffix()`：SFT 前后夹心场景；在 `tail_text` 中拼接后缀，确保 labels 覆盖后缀。
-     - `_get_sft_sample()`：纯 SFT；`labels = input_ids.clone()`，随后 `labels[:assistant_start] = -100` 只训练助手输出。
-   - **collate_fn**：
-     - 若 `is_sft=True`，`embedding_position=-1`，`embeddings_to_insert` 用零向量占位。
-     - 否则拼接 target label 与 embedding。
-   - **训练循环（`EnhancedTextMemoryTrainer`）**：
-     - Accelerator 负责混合精度（BF16）与梯度累积。
-     - 训练开始时打印 sample_type、embedding_injection 位置。
-     - 每 epoch 可根据 `training_config.memory_epochs` 迭代；结束后 `_run_test_generation()` 抽样验证，并带上 `guide_text`。
-   - 结束后 `merge_and_save_model()` 生成最终 LoRA 合并模型（可选保存完整 VL assets）。
-
-### 2.3 输出 / 清理
-- 保存路径：
-  - `memory.training.trained_model_dir = ./models/trained`（会生成 `model_YYYYMMDD_HHMMSS`）。
-  - `memory.training.token_added_model_dir = ./models/token_added`（训练中若新增 token，会写拷贝）。
-  - `memory.training.memory_db_dir = ./models/memory_db`（embedding 数据、`memory_embeddings.pt` 等）。
-- `cleanup_after_training()`：
-  - 删除聊天 JSON、临时训练数据、`uploads/` 下临时文件。
-  - 保留 `memory_embeddings.pt` 等最终成果。
+   本方案希望以“极低的推理开销 + 接近 RAG 的灵活性”填补两者之间的空隙。
 
 ---
 
-## 3. 关键参数摘录
+## 2. 总览：在自回归循环里“召唤记忆”
 
-| 组件 | 参数 | 默认 | 备注 |
-| --- | --- | --- | --- |
-| Generation | `max_new_tokens` | 40960 | 决定 KV cache 预留；若显存紧张可调至 1024/2048 |
-| Generation | `temperature/top_p/top_k` | 1.0 / 0.95 / 20 | 普通 token 采样 |
-| Recall | `autorecall_top_k` | 10 | 用于 memory logits warper |
-| Recall | `autorecall_temperature/top_p` | 0.8 / 0.95 | 记忆采样温度/TopP |
-| Mixed Dataset | 3 类比例 | 1:1:1 | memory_front / memory_full / sft_pure |
-| Training | `embedding_batch_size` | 4 | 批量向量化时的 batch |
-| Training | `memory_dataset_max_length` | 3000 | 构样时最大 token 长度 |
-| Training | `memory_epochs` | 30 | 第二阶段训练 epoch，可按资源调小 |
-| Training | `learning_rate` | 1e-4 | AdamW 学习率 |
+### 2.1 关键概念
+
+| 名称 | 说明 |
+| --- | --- |
+| `<recall>` token | 模型在自回归过程中自主生成，表示“我要调取记忆” |
+| Memory Head | 与 `lm_head` 对称的模块：输入 `<recall>` 的 hidden state，输出所有记忆向量的 logits |
+| Memory Embedding | 与 `input_embeddings` 对称的模块：把选定的记忆向量直接作为下一步输入 embedding |
+| `<|memory_pad|>` | 占位符 token，用来占据“记忆注入”的位置，训练和推理都保持一致 |
+
+### 2.2 整体流程（可结合 `docs/MEMORY_RECALL_FLOW.md`）
+
+1. **触发**：模型生成 `<recall>`。  
+2. **摘要**：取 `<recall>` 位置的 hidden state 作为 query，代表当前上下文。  
+3. **检索**：在记忆库中计算 query 与所有向量的余弦相似度，得到 logits。  
+4. **采样**：与普通 token 完全一致，使用 `TemperatureLogitsWarper`、`TopKLogitsWarper`、`TopPLogitsWarper` 处理，再采样或贪婪选择一个记忆条目。  
+5. **注入**：强制下一步生成 `<|memory_pad|>`，同时把选中的记忆向量当作 embedding 输入模型。  
+6. **生成**：模型以记忆 embedding 为起点继续自回归，输出被训练好的“记忆文本 + 结束提示 + 后续 SFT 内容”。  
+7. **恢复**：完成记忆输出后，所有标志位被清理，模型继续普通自回归。
+
+### 2.3 对称设计速览
+
+| 维度 | 普通 token 生成 | 记忆扩展 |
+| ---- | --------------- | -------- |
+| Head | `lm_head` 输出 vocab logits | **Memory Head** 输出记忆 logits |
+| 采样 | logits_processor → logits_warper → softmax | 完全相同 |
+| 输入 | token ID → embedding lookup | 直接注入记忆向量（跳过 embedding 层） |
+| 控制位 | 无 | `<recall>` 触发 / `<|memory_pad|>` 占位 |
+| 状态管理 | KV cache、停止条件等 | 复用，无额外分支 |
+
+这种“对称性”是方案的核心：记忆流程看起来像是模型在生成“一个特殊的 token”，因此极易融入现有的自回归实现。
 
 ---
 
-## 4. LLM 消化提示
-> 如需让其他模型理解此框架，可附一句指令：  
-> “请根据文档中的步骤，梳理自回归记忆生成与训练流程的关键输入/输出、配置依赖和潜在瓶颈，并列出注意事项。”
+## 3. 深入：每个环节的技术细节
 
---- 
+### 3.1 `<recall>` 触发判定
+1. 每次循环开始前，`custom_generate` 会调用 `model.prepare_inputs_for_generation()`，得到当前的 `input_ids`。  
+2. 若 `input_ids` 的最后一个 token 等于 `<recall>` 且 `memory.autoregressive_recall.enabled` 为真，则设置 `recall_triggered = True`，进入记忆分支。  
+3. 如果不满足条件，流程与普通自回归完全相同。
 
-附：如对内存、回忆行为有额外问题，可结合 `docs/AUTOREGRESSIVE_GENERATION.md` 和 `docs/MEMORY_RECALL_FLOW.md` 获取图示化解释。*** End Patch***
-*** End Patch***}}} />;
+### 3.2 Memory Head：从 `<recall>` hidden state 到记忆 logits
+
+参考 `docs/AUTOREGRESSIVE_GENERATION.md`：
+1. **Query 构造**  
+   ```python
+   query_vector = last_hidden_state[0, -1, :]  # 即 <recall> 位置的 hidden state
+   ```
+2. **相似度计算**  
+   - 记忆库中的所有向量在写入时都做了 L2 normalize。  
+   - Memory Head 简单地做一次矩阵乘（query vs. 全量记忆向量），得到所有候选的余弦分数。  
+   - 不做 softmax，只返回 logits（形状 `[num_memory_entries]`），与 `lm_head` 输出 vocab logits 完全对称。  
+3. **调试输出**：可选地打印相似度 top-k，便于调试记忆内容。
+
+### 3.3 Logits 统一处理
+- 记忆 logits 与 token logits 使用同样的 `LogitsProcessorList`（可配置重复惩罚等）与 `LogitsWarper`（Temperature / TopK / TopP）。  
+- 之所以重复 Top-k 截断，是为了确保记忆采样与 token 采样的行为完全一致。  
+- `autorecall_use_sampling` 控制是否采样；若为 False，则直接 argmax。
+
+### 3.4 Memory Embedding：跳过 embedding 层
+1. 把选中的记忆向量 reshape 成 `[1, 1, hidden_dim]`，并复制到模型所在的 device / dtype。  
+2. 设置 `forced_next_token_id = memory_pad_token_id`，确保自回归序列仍然有一个 token ID。  
+3. 下一轮前向时，如果 `override_next_embed` 非空，就从 `forward_inputs` 中删除 `input_ids`，改传 `inputs_embeds=override_next_embed`。  
+4. 这意味着 `<|memory_pad|>` 的 embedding 完全由记忆向量决定，而不是从词表 lookup。  
+5. 前向完成后立即清除 `override_next_embed` 与 `forced_next_token_id`，避免污染后续循环。
+
+### 3.5 循环时序（详见 `docs/MEMORY_RECALL_FLOW.md`）
+
+| 循环 | 输入末尾 | 操作 | 状态变化 |
+| ---- | -------- | ---- | -------- |
+| **N** | 普通 token → 生成 `<recall>` | 无 | 常规自回归 |
+| **N+1** | `<recall>` | Memory Head 检索 + 设置注入参数 | `override_next_embed`、`forced_next_token_id` 被填充 |
+| **N+2** | `<|memory_pad|>` | 用记忆 embedding 前向；清空标志 | 所有记忆相关变量恢复默认 |
+
+---
+
+## 4. 训练体系：把记忆写进模型
+
+### 4.1 核心目标
+1. **Step 1：Recall Token 训练**  
+   - 目的是让 `<recall>` 的 hidden state 成为“上下文摘要器”。  
+   - 训练后 `<recall>` 应该能在不同上下文中产生稳定的 query 以驱动检索。
+
+2. **Step 2：Memory Decoding 训练**  
+   - 目的是让模型看到记忆向量就能还原原文，并保持原有的思维/对话结构。  
+   - 同时需要保证模型不会因为频繁回忆而丢失普通对话能力。
+
+### 4.2 Step 1 详解（参见 `docs/SFT_SAMPLING_FLOW.md`）
+
+1. **样本来源**  
+   - 从大规模 SFT 语料中提取 `<think>...</think>` 思考段。  
+   - 目标数量 = 记忆条目数量 × 1.5（冗余用于过滤）。  
+   - 抽样时打乱顺序，确保覆盖面。
+
+2. **长度过滤**  
+   - 使用 tokenizer 对每个 `<think>` 段落编码，若 token 数超过 `training_config.sft_max_tokens`（例如 2500），直接跳过。  
+   - 跳过后立即从剩余样本中补抽，保证最终数量满足要求。
+
+3. **训练方式**  
+   - 输入：原始上下文（包含 `<think>` 段）。  
+   - 目标：让模型在 `<recall>` 位置输出能够代表该段思考内容的 embedding。  
+   - LoRA 仅挂在 Q/V 上，减少显存占用。  
+   - 训练完成后得到 `<recall>` 的“聚合能力”，为 Step 2 打基础。
+
+### 4.3 Step 2 详解（参见 `docs/SECOND_STEP_TRAINING_DATA.md`）
+
+1. **数据集结构：MixedMemorySFTDataset**
+
+| 类型 | 输入序列 | label 分布 | 设计动机 |
+| ---- | -------- | ----------- | -------- |
+| **memory_front** | 随机上下文 + `<recall>` + `<|memory_pad|>` + 记忆文本 + 结束提示 | 记忆文本 + 结束提示 | 训练模型在噪声环境下回忆 |
+| **memory_full** | SFT 前缀 + `<recall>` + `<|memory_pad|>` + 记忆文本 + 结束提示 + SFT 后缀 | 记忆文本 + 结束提示 + SFT 后缀 | 让回忆内容与思维/回答结构无缝衔接 |
+| **sft_only** | 纯 SFT 对话（无记忆 token） | 仅 assistant 段落 | 保持常规对话能力，避免退化 |
+
+2. **label 设置要点**
+   - `<recall>` token 必须有 label（等于其 token ID），确保触发能力不会逐渐丧失。  
+   - `<|memory_pad|>` label 设为 -100，因为该位置在推理时由记忆向量覆盖。  
+   - `memory_full` 的后缀来自同一条 SFT 样本的 `<think>` 之后部分，让模型在回忆结束后自然接回原问题的回答。  
+   - `sft_only` 只训练 assistant 内容，system/user 均置为 -100。
+
+3. **混合比例与抽样**
+   - 每个 epoch 都调用 `refresh_epoch_data()`，重新从原始 SFT 池中抽样，总量约为记忆条目 × 1.5。  
+   - 抽取后按三等分划分到三种类型，保证每个 batch 中长期混合三种样本。  
+   - 抽样前会调用 `_is_sft_within_token_limit()`，使用 `processor.apply_chat_template(..., tokenize=True)` 计算真实 token 数，超限则跳过并补抽。  
+   - 日志会输出原始索引，方便验证是否真的“每个 epoch 重抽”。
+
+4. **训练循环**
+   - `EnhancedTextMemoryTrainer` 使用 Accelerate（BF16 + 梯度累积），在多卡上保持效率。  
+   - 训练过程中打印样本类型、embedding 插入位置、上下文长度等，方便定位异常。  
+   - 每个 epoch 结束调用 `test_memory_recall()`，直接用真实记忆向量进行生成验证（确保 `<|memory_pad|>` 位于 `len(full_input_tokens) - 1`）。  
+   - 训练完成后合并 LoRA 权重，得到最终部署模型。
+
+### 4.4 为什么要这样设计？
+
+1. **Step 1**：若不先训练 `<recall>`，模型会把 `<recall>` 当作普通 token，输出的 hidden state 质量极低，导致检索完全靠运气。  
+2. **Step 2**：若只训练 memory_front，则模型在回忆后容易“结束输出”；memory_full 提供了“回忆 + 原 SFT 后缀”的组合，强迫模型回忆后继续按照原先思维/回答结构输出。  
+3. `sft_only` 的存在防止模型只剩“回忆”这条出路，保证普通对话能力不退化。
+
+---
+
+## 5. 数据采样与长度控制：细致到每一步
+
+### 5.1 Step 1：SFT `<think>` 抽样
+
+| 步骤 | 描述 |
+| ---- | ---- |
+| 加载语料 | `_load_sft_dataset()` 返回原始 JSON 行 |
+| 标准化 | `_standardize_sft_messages()` 把多模态内容收敛为统一格式 |
+| 随机打乱 | `random.shuffle(sft_samples)` |
+| 提取 `<think>` | `processor.apply_chat_template(..., tokenize=False)` → 查找 `<think>...</think>` |
+| 长度校验 | `tokenizer(thinking_content, return_tensors="pt")`，超限跳过 |
+| 收集 | 直到 `num_memory_entries * 1.5` 条合格样本 |
+| 批量向量化 | `_batch_extract_embeddings()`，取最后一个 token 的 hidden state |
+
+### 5.2 Step 2：按 epoch 动态抽样
+
+1. 仅在训练开始前把 SFT 样本标准化为 `{messages, index}`，不做抽样。  
+2. 每个 epoch 调用 `_sample_sft_for_epoch(total_target)`：  
+   - `candidate_indices = list(range(len(sample_records)))` → `random.shuffle()`  
+   - 逐条检查 token 长度：  
+     ```python
+     within_limit, seq_len = self._is_sft_within_token_limit(processor, messages, max_tokens)
+     ```  
+   - 合格样本记录 `messages`、`full_text`（若包含 `<think>`）、原始 `index`。  
+   - 达到 `total_target` 后停止，否则抛错提醒“样本不足”。  
+3. `refresh_epoch_data()` 把采样到的 SFT 三等分为：  
+   - `prefix_messages`（记忆前置）  
+   - `middle_full_texts`（记忆夹心，需要完整文本）  
+   - `pure_messages`（纯 SFT）  
+4. 记忆条目同样被随机打散并分配给 memory_front / memory_full / sft_only。  
+5. 日志中打印“纯 SFT 原始索引”“夹心样本原始索引”，方便人工核查随机性。
+
+这一系列步骤保证了“每个 epoch 都从原始语料重新抽取 + 严格长度控制 + 可追溯原始索引”。
+
+---
+
+## 6. 预期优势与技术定位
+
+### 6.1 相较于常规微调
+- **推理成本几乎为零**：回忆只是在输入里多了 `<recall>` + 一个向量，不需要更长 prompt 或额外模型。  
+- **训练成本可控**：LoRA + 两阶段训练即可，把记忆写入模型而无需重新做大规模 SFT。  
+- **灵活写入**：记忆条目来自任何来源，写入后即可在推理中触发，不受 SFT 语料限制。
+
+### 6.2 相较于 RAG
+- **推理链路更短**：不需要外部检索服务，也不需要额外 prompt 拼接。  
+- **输出更连贯**：记忆内容已经通过第二阶段训练写入模型，因此能与原有思维流/回答风格自然衔接。  
+- **知识真正“内化”**：虽然训练目标是“根据记忆 embedding 还原文本”，但模型在学习过程中同样会吸收文本中 token 之间的关系。
+
+---
+
+## 7. 下一步实验计划
+
+| 阶段 | 内容 |
+| ---- | ---- |
+| **任务选择** | 选取一个对领域记忆敏感的任务（如专业知识问答、企业规章答疑）。 |
+| **方案对比** | 本方案 vs 标准微调（SFT） vs RAG。 |
+| **评估指标** | 记忆保持（多轮对话稳定性）、推理成本（延迟/显存）、输出结构（是否保持原思考链）。 |
+| **期望** | 本方案在记忆保持上接近 RAG，但推理成本接近常规微调；同时输出结构最好。 |
+
+---
+
+## 8. 阅读指引与交叉引用
+
+- 若需源码级细节：  
+  - `docs/AUTOREGRESSIVE_GENERATION.md`: Memory Head、override_next_embed、KV cache 行为  
+  - `docs/MEMORY_RECALL_FLOW.md`: N → N+1 → N+2 的时序图与状态机
+- 若需数据构造与采样细节：  
+  - `docs/SFT_SAMPLING_FLOW.md`: 两个阶段的 SFT 抽样策略  
+  - `docs/SECOND_STEP_TRAINING_DATA.md`: memory_front / memory_full / sft_only 的具体 label 设计
+
+> **给其他模型的提示**：  
+> “请根据本文描述，梳理 `<recall>` 触发 → 记忆检索 → 记忆注入 的具体步骤，并说明两阶段训练分别解决了哪些问题。”
+
+---
+
+## 9. 总结
+
+本方案在不改变模型主干结构的情况下，把“记忆检索”当作“生成一个特殊 token”来看待，从而：
+1. 保证自回归循环的完整性和对称性；
+2. 保证训练与推理的数据/行为完全一致（含 `<recall>`、`<|memory_pad|>` 的位置、embedding 注入方式等）；
+3. 通过两阶段训练，让 `<recall>` 学会输出高质量 query，记忆向量也能驱动模型生成结构化回答。
+
+下一步将通过系统实验对比普通微调与 RAG，验证该方案在成本、记忆保持、输出结构之间的平衡点。***
 

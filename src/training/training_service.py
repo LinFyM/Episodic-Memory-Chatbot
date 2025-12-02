@@ -688,9 +688,8 @@ class MemoryTrainingService:
             self.save_memory_embeddings_from_file(temp_training_data_path)
 
             # 同时提取等量的SFT向量用于第一步训练，防止<recall>token过拟合
-            sft_vectors_path = self._extract_sft_vectors_for_recall_training(
-                num_entries, base_model, base_processor
-            )
+            # 注意：现在使用embedding模型提取SFT向量，不再需要base_model和base_processor
+            sft_vectors_path = self._extract_sft_vectors_for_recall_training(num_entries)
 
         # 基础模型上下文自动清理
 
@@ -1435,8 +1434,13 @@ class MemoryTrainingService:
     def _append_memory_text_to_file(self, memory_text: str, file_path: str):
         return memory_extraction._append_memory_text_to_file(self, memory_text, file_path)
 
-    def _extract_sft_vectors_for_recall_training(self, num_memory_entries: int, model, processor) -> Optional[str]:
-        return memory_extraction.extract_sft_vectors_for_recall_training(self, num_memory_entries, model, processor)
+    def _extract_sft_vectors_for_recall_training(self, num_memory_entries: int) -> Optional[str]:
+        """
+        提取SFT向量用于第一步训练
+        
+        注意：现在使用embedding模型提取向量，不再需要普通模型和processor
+        """
+        return memory_extraction.extract_sft_vectors_for_recall_training(self, num_memory_entries)
 
     def _load_memory_texts_from_file(self, file_path: str) -> List[str]:
         return memory_extraction._load_memory_texts_from_file(self, file_path)

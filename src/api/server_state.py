@@ -242,8 +242,9 @@ def initialize_model(model_path: str, target_device: str):
             embedding_dim = input_embeddings.weight.shape[1]
             _log.info(f"📊 从模型 input_embeddings 获取维度: {embedding_dim}")
         except Exception as e:
-            embedding_dim = 4096
-            _log.warning(f"⚠️ 无法从模型获取 embedding 维度，使用默认值: {embedding_dim}")
+            # 4B模型默认是2560维，8B模型是4096维
+            embedding_dim = 2560
+            _log.warning(f"⚠️ 无法从模型获取 embedding 维度，使用默认值: {embedding_dim} (4B模型)")
         
         memory_device = actual_device
         if hasattr(memory_device, "type"):
